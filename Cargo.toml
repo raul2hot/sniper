@@ -1,0 +1,74 @@
+[package]
+name = "sniper"
+version = "0.1.0"
+edition = "2021"
+authors = ["Your Name <your@email.com>"]
+description = "Arbitrage detection bot for Uniswap V3/V4"
+
+[dependencies]
+# ============================================
+# PHASE 1: The Cartographer (Data Ingest)
+# ============================================
+
+# Ethereum interaction (replaces deprecated ethers-rs)
+alloy = { version = "1.0", features = [
+    "full",           # All features for MVP simplicity
+    "provider-http",  # HTTP RPC connections
+    "rpc-types",      # Ethereum RPC type definitions
+] }
+
+# Async runtime (required for alloy)
+tokio = { version = "1.42", features = ["full"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# ============================================
+# PHASE 2: The Brain (Cycle Detection)
+# ============================================
+
+# Graph data structure & algorithms (Bellman-Ford)
+petgraph = "0.8"
+
+# ============================================
+# PHASE 3: The Simulator (EVM Simulation)
+# ============================================
+
+# Local EVM simulation (fork mainnet state)
+revm = { version = "30", features = [
+    "std",
+    "alloydb",  # Connect revm to alloy's database
+] }
+
+# ============================================
+# UTILITIES
+# ============================================
+
+# Error handling
+eyre = "0.6"
+color-eyre = "0.6"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Environment variables (.env file support)
+dotenvy = "0.15"
+
+# CLI argument parsing (for future use)
+clap = { version = "4.5", features = ["derive"] }
+
+# Pretty console output
+console = "0.15"
+indicatif = "0.17"  # Progress bars
+
+[dev-dependencies]
+# Testing utilities
+tokio-test = "0.4"
+
+[profile.release]
+# Optimize for speed in production
+opt-level = 3
+lto = true          # Link-time optimization
+codegen-units = 1   # Better optimization, slower compile
