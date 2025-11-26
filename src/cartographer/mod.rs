@@ -1,18 +1,7 @@
-//! Phase 1: The Cartographer
-//!
-//! Responsible for:
-//! - Fetching pool data from RPC across multiple DEXes
-//! - Building the token graph with price edges
+//! Phase 1: The Cartographer - Enhanced Edition
 //!
 //! Supported DEXes:
-//! - Uniswap V3 (concentrated liquidity)
-//! - Uniswap V2 (constant product)
-//! - Sushiswap V3 (concentrated liquidity)
-//! - Sushiswap V2 (constant product)
-//!
-//! Submodules:
-//! - `fetcher`: RPC calls to get pool state
-//! - `graph`: Graph construction from pool data
+//! - Uniswap V3/V2, Sushiswap V2, PancakeSwap V3, Balancer V2, Curve
 
 mod fetcher;
 mod graph;

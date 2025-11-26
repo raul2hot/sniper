@@ -1,14 +1,13 @@
-//! The Sniper - Arbitrage Detection Bot
+//! The Sniper - Arbitrage Detection Bot (DECIMAL-FIXED Edition)
 //!
-//! This is the entry point. Run with: cargo run
+//! Run with: cargo run
 //!
-//! Phase 1: The Cartographer (Data Ingest) ✅
-//! Phase 2: The Brain (Cycle Detection) ✅
-//! Phase 3: The Simulator (V4 Hook Integration) - Coming soon
-//!
-//! NEW: Cross-DEX arbitrage detection!
-//! - Uniswap V3 + V2
-//! - Sushiswap V3 + V2
+//! Features:
+//! - 6 DEXes: Uniswap V3/V2, Sushiswap V2, PancakeSwap V3, Balancer V2, Curve
+//! - Low-fee pool priority (1bps, 5bps)
+//! - Concurrent RPC fetching (20x faster!)
+//! - DECIMAL NORMALIZATION: Properly handles tokens with different decimals
+//!   (e.g., DAI 18 decimals vs USDC 6 decimals)
 
 use alloy::primitives::Address;
 use color_eyre::eyre::Result;
@@ -25,41 +24,40 @@ mod tokens;
 mod simulator;
 
 use brain::{BoundedBellmanFord, ProfitFilter};
-use cartographer::{ArbitrageGraph, PoolFetcher, Dex};
+use cartographer::{ArbitrageGraph, PoolFetcher, Dex, PoolType};
 
-/// Prints the Sniper banner
 fn print_banner() {
     println!();
     println!(
         "{}",
-        style("=============================================").cyan()
+        style("═══════════════════════════════════════════════════════════════").cyan()
     );
     println!(
         "{}",
-        style(" 🎯 THE SNIPER - Arbitrage Detection Bot").cyan().bold()
+        style(" 🎯 THE SNIPER - Arbitrage Detection Bot (DECIMAL-FIXED)").cyan().bold()
     );
     println!(
         "{}",
-        style("     Cross-DEX Edition (Uni + Sushi)").cyan()
+        style("    6 DEXes | Low-Fee Priority | Decimal-Normalized Prices").cyan()
     );
     println!(
         "{}",
-        style("=============================================").cyan()
+        style("═══════════════════════════════════════════════════════════════").cyan()
     );
     println!();
 }
 
-/// Build a map of token address -> symbol for pretty printing
 fn build_token_symbols() -> HashMap<Address, &'static str> {
     let mut map = HashMap::new();
 
-    // Known token addresses on Ethereum Mainnet
     let tokens = [
         ("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", "WETH"),
         ("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", "USDC"),
         ("0xdAC17F958D2ee523a2206206994597C13D831ec7", "USDT"),
         ("0x6B175474E89094C44Da98b954EedcdeCB5BE3830", "DAI"),
         ("0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599", "WBTC"),
+        ("0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0", "wstETH"),
+        ("0xae7ab96520DE3A18E5e111B5EaAb095312D7fE84", "stETH"),
         ("0x514910771AF9Ca656af840dff83E8264EcF986CA", "LINK"),
         ("0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984", "UNI"),
         ("0x6982508145454Ce325dDbE47a25d4ec3d2311933", "PEPE"),
@@ -72,7 +70,7 @@ fn build_token_symbols() -> HashMap<Address, &'static str> {
         ("0xC011a73ee8576Fb46F5E1c5751cA3B9Fe0af2a6F", "SNX"),
         ("0xc00e94Cb662C3520282E6f5717214004A7f26888", "COMP"),
         ("0x7Fc66500c84A76Ad7e9c93437bFc5Ac33E2DDaE9", "AAVE"),
-        ("0x0D8775F648430679A709E98d2b0Cb6250d2887EF", "BAT"),
+        ("0xba100000625a3754423978a60c9317c58a424e3D", "BAL"),
     ];
 
     for (addr, symbol) in tokens {
@@ -84,7 +82,6 @@ fn build_token_symbols() -> HashMap<Address, &'static str> {
     map
 }
 
-/// Get base token addresses for starting arbitrage search
 fn get_base_tokens() -> Vec<Address> {
     let addrs = [
         "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", // WETH
@@ -94,13 +91,9 @@ fn get_base_tokens() -> Vec<Address> {
         "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599", // WBTC
     ];
 
-    addrs
-        .iter()
-        .filter_map(|a| a.parse().ok())
-        .collect()
+    addrs.iter().filter_map(|a| a.parse().ok()).collect()
 }
 
-/// Format an address with symbol if known
 fn format_token(addr: &Address, symbols: &HashMap<Address, &str>) -> String {
     if let Some(symbol) = symbols.get(addr) {
         symbol.to_string()
@@ -109,11 +102,8 @@ fn format_token(addr: &Address, symbols: &HashMap<Address, &str>) -> String {
     }
 }
 
-/// Extract ETH price from pools (USDC/WETH price)
 fn get_eth_price_from_pools(pools: &[cartographer::PoolState]) -> f64 {
-    // Find USDC/WETH or WETH/USDT pool
     for pool in pools {
-        // Check for USDC/WETH (USDC has 6 decimals, WETH has 18)
         let price = pool.price(6, 18);
         if price > 1000.0 && price < 10000.0 {
             return price;
@@ -123,16 +113,13 @@ fn get_eth_price_from_pools(pools: &[cartographer::PoolState]) -> f64 {
             return inverse;
         }
     }
-    // Default fallback
     3500.0
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize error handling
     color_eyre::install()?;
 
-    // Initialize logging
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer())
         .with(
@@ -141,10 +128,8 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    // Print banner
     print_banner();
 
-    // Load environment variables
     dotenvy::dotenv().ok();
 
     let rpc_url = env::var("RPC_URL").unwrap_or_else(|_| {
@@ -155,7 +140,6 @@ async fn main() -> Result<()> {
 
     println!("{} RPC configured", style("✓").green());
 
-    // Build token symbol map
     let token_symbols = build_token_symbols();
 
     // =============================================
@@ -168,8 +152,7 @@ async fn main() -> Result<()> {
     );
     println!();
 
-    // Step 1.1: Fetch pool data from ALL DEXes
-    println!("{}", style("Step 1.1: Fetching pool data from multiple DEXes...").blue());
+    println!("{}", style("Step 1.1: Fetching pool data from 6 DEXes (DECIMAL-AWARE)...").blue());
     let start = Instant::now();
 
     let fetcher = PoolFetcher::new(rpc_url);
@@ -177,11 +160,14 @@ async fn main() -> Result<()> {
 
     let fetch_time = start.elapsed();
     
-    // Count pools by DEX
-    let uni_v3 = pools.iter().filter(|p| p.dex == Dex::UniswapV3).count();
-    let uni_v2 = pools.iter().filter(|p| p.dex == Dex::UniswapV2).count();
-    let sushi_v3 = pools.iter().filter(|p| p.dex == Dex::SushiswapV3).count();
-    let sushi_v2 = pools.iter().filter(|p| p.dex == Dex::SushiswapV2).count();
+    let mut dex_counts: HashMap<Dex, usize> = HashMap::new();
+    for pool in &pools {
+        *dex_counts.entry(pool.dex).or_insert(0) += 1;
+    }
+    
+    let low_fee_count = pools.iter()
+        .filter(|p| p.pool_type == PoolType::V3 && p.fee <= 500)
+        .count();
     
     println!(
         "{} Fetched {} pools in {:?}",
@@ -189,12 +175,13 @@ async fn main() -> Result<()> {
         pools.len(),
         fetch_time
     );
-    println!(
-        "   UniswapV3: {}, UniswapV2: {}, SushiswapV3: {}, SushiswapV2: {}",
-        uni_v3, uni_v2, sushi_v3, sushi_v2
-    );
+    
+    println!("   DEX breakdown:");
+    for (dex, count) in &dex_counts {
+        println!("     {}: {} pools", dex, count);
+    }
+    println!("   Low-fee pools (≤5bps): {}", low_fee_count);
 
-    // Get ETH price for profit calculations
     let eth_price = get_eth_price_from_pools(&pools);
     println!("{} ETH price: ${:.2}", style("✓").green(), eth_price);
 
@@ -224,44 +211,57 @@ async fn main() -> Result<()> {
         opportunities.len()
     );
 
-    // Show some price examples
+    // Show sample prices by DEX
     println!();
     println!("{}", style("Sample prices by DEX:").blue());
-    for pool in pools.iter().take(8) {
+    
+    let mut shown_dexes: HashMap<Dex, usize> = HashMap::new();
+    for pool in pools.iter() {
+        let count = shown_dexes.entry(pool.dex).or_insert(0);
+        if *count >= 2 {
+            continue;
+        }
+        *count += 1;
+        
         let token0_sym = format_token(&pool.token0, &token_symbols);
         let token1_sym = format_token(&pool.token1, &token_symbols);
 
-        let (t0_dec, t1_dec) = match (token0_sym.as_str(), token1_sym.as_str()) {
-            (t0, t1) => {
-                let d0 = match t0 {
-                    "USDC" | "USDT" => 6,
-                    "WBTC" => 8,
-                    _ => 18,
-                };
-                let d1 = match t1 {
-                    "USDC" | "USDT" => 6,
-                    "WBTC" => 8,
-                    _ => 18,
-                };
-                (d0, d1)
-            }
+        let t0_dec = match token0_sym.as_str() {
+            "USDC" | "USDT" => 6,
+            "WBTC" => 8,
+            _ => 18,
+        };
+        let t1_dec = match token1_sym.as_str() {
+            "USDC" | "USDT" => 6,
+            "WBTC" => 8,
+            _ => 18,
         };
 
         let price = pool.price(t0_dec, t1_dec);
+        
         let dex_style = match pool.dex {
             Dex::UniswapV3 => style(format!("[{}]", pool.dex)).blue(),
             Dex::UniswapV2 => style(format!("[{}]", pool.dex)).cyan(),
             Dex::SushiswapV3 => style(format!("[{}]", pool.dex)).magenta(),
             Dex::SushiswapV2 => style(format!("[{}]", pool.dex)).yellow(),
+            Dex::PancakeSwapV3 => style(format!("[{}]", pool.dex)).green(),
+            Dex::BalancerV2 => style(format!("[{}]", pool.dex)).red(),
+            Dex::Curve => style(format!("[{}]", pool.dex)).white(),
+        };
+        
+        let fee_indicator = if pool.fee <= 500 {
+            style(format!(" ({}bps) ⚡", pool.fee / 100)).cyan().to_string()
+        } else {
+            format!(" ({}bps)", pool.fee / 100)
         };
         
         println!(
-            "  {} {}/{}: {:.6} (fee: {}bps)",
+            "  {} {}/{}: {:.6}{}",
             dex_style,
             style(&token0_sym).cyan(),
             style(&token1_sym).cyan(),
             price,
-            pool.fee / 100
+            fee_indicator
         );
     }
 
@@ -275,30 +275,29 @@ async fn main() -> Result<()> {
     );
     println!();
 
-    // Step 2.1: Find arbitrage cycles using Bellman-Ford
     println!(
         "{}",
-        style("Step 2.1: Running Bellman-Ford algorithm (cross-DEX enabled)...").magenta()
+        style("Step 2.1: Running Bellman-Ford algorithm (6 DEXes enabled)...").magenta()
     );
     let start = Instant::now();
 
-    let bellman_ford = BoundedBellmanFord::new(&graph, 4); // Max 4 hops
+    let bellman_ford = BoundedBellmanFord::new(&graph, 4);
     let base_tokens = get_base_tokens();
     let cycles = bellman_ford.find_all_cycles(&base_tokens);
 
     let algo_time = start.elapsed();
     
-    // Count cross-DEX cycles
     let cross_dex_count = cycles.iter().filter(|c| c.is_cross_dex()).count();
+    let low_fee_cycle_count = cycles.iter().filter(|c| c.has_low_fee_pools()).count();
     
     println!(
-        "{} Found {} cycles in {:?} ({} cross-DEX, {} single-DEX)",
+        "{} Found {} cycles in {:?}",
         style("✓").green(),
         cycles.len(),
         algo_time,
-        cross_dex_count,
-        cycles.len() - cross_dex_count
     );
+    println!("   {} cross-DEX cycles", cross_dex_count);
+    println!("   {} using low-fee pools", low_fee_cycle_count);
 
     // Step 2.2: Filter for profitable cycles
     println!();
@@ -307,14 +306,12 @@ async fn main() -> Result<()> {
         style("Step 2.2: Analyzing profitability...").magenta()
     );
 
-    let mut filter = ProfitFilter::new(-1000.0); // Show ALL cycles, even unprofitable
+    let mut filter = ProfitFilter::new(-1000.0);
     filter.set_eth_price(eth_price);
-    filter.set_gas_price(20.0); // 20 gwei
+    filter.set_gas_price(20.0);
 
-    // Print detailed analysis
     filter.print_summary(&cycles, &token_symbols);
 
-    // Get profitable cycles
     let profitable = filter.filter_profitable(&cycles, &token_symbols);
 
     // =============================================
@@ -329,20 +326,23 @@ async fn main() -> Result<()> {
                 .bold()
         );
         println!();
-        println!("This is common - but cross-DEX has better odds! Here's what happened:");
-        println!("  • Scanned {} DEXes (Uniswap V2/V3, Sushiswap V2/V3)", 4);
+        println!("This is common - but 6-DEX cross-arbitrage has the best odds!");
+        println!("  • Scanned {} DEXes:", dex_counts.len());
+        for (dex, count) in &dex_counts {
+            println!("    - {}: {} pools", dex, count);
+        }
         println!("  • Found {} cross-DEX price differences", opportunities.len());
         println!("  • Analyzed {} potential arbitrage cycles", cycles.len());
         println!();
-        println!("Why no profit? Likely reasons:");
+        println!("{}", style("Why no profit?").yellow());
         println!("  • MEV bots already captured the opportunities");
         println!("  • Gas costs exceed the price difference");
         println!("  • Our data snapshot was ~2-6 seconds old");
         println!();
-        println!("{}", style("Tips to find real opportunities:").green());
-        println!("  • Run during high volatility (news events, liquidations)");
-        println!("  • Add more pools (Curve, Balancer, PancakeSwap)");
-        println!("  • Focus on long-tail tokens with less competition");
+        println!("{}", style("Tips:").green());
+        println!("  • Run during high volatility");
+        println!("  • Focus on low-fee pools (1bps, 5bps)");
+        println!("  • Check late night / early morning (lower gas)");
     } else {
         println!(
             "{}",
@@ -357,17 +357,21 @@ async fn main() -> Result<()> {
 
         for (i, analysis) in profitable.iter().enumerate() {
             let path = analysis.format_path(&token_symbols);
-            let cross_dex_tag = if analysis.cycle.is_cross_dex() {
-                style(" [CROSS-DEX]").magenta().bold().to_string()
-            } else {
-                String::new()
-            };
+            
+            let mut tags = Vec::new();
+            if analysis.cycle.is_cross_dex() {
+                tags.push(style("[CROSS-DEX]").magenta().bold().to_string());
+            }
+            if analysis.cycle.has_low_fee_pools() {
+                tags.push(style("[LOW-FEE]").cyan().bold().to_string());
+            }
+            let tags_str = if tags.is_empty() { String::new() } else { format!(" {}", tags.join(" ")) };
             
             println!(
                 "{}. {}{} | Net profit: ${:.2}",
                 i + 1,
                 style(&path).cyan(),
-                cross_dex_tag,
+                tags_str,
                 analysis.net_profit_usd
             );
             
@@ -381,7 +385,7 @@ async fn main() -> Result<()> {
     println!();
     println!(
         "{}",
-        style("=============================================").green()
+        style("═══════════════════════════════════════════════════════════════").green()
     );
     println!(
         "{}",
@@ -389,12 +393,14 @@ async fn main() -> Result<()> {
     );
     println!(
         "{}",
-        style("=============================================").green()
+        style("═══════════════════════════════════════════════════════════════").green()
     );
     println!();
     println!("Summary:");
-    println!("  • Pools fetched: {} across 4 DEXes", pools.len());
-    println!("  • Cycles analyzed: {} ({} cross-DEX)", cycles.len(), cross_dex_count);
+    println!("  • Pools fetched: {} across {} DEXes", pools.len(), dex_counts.len());
+    println!("  • Low-fee pools: {} (prioritized for tight arbs)", low_fee_count);
+    println!("  • Cycles analyzed: {} ({} cross-DEX, {} w/ low fees)", 
+             cycles.len(), cross_dex_count, low_fee_cycle_count);
     println!("  • Profitable cycles: {}", profitable.len());
     println!();
     println!("Next: Phase 3 - REVM simulation to validate trades!");

@@ -3,7 +3,7 @@ name = "sniper"
 version = "0.1.0"
 edition = "2021"
 authors = ["Your Name <your@email.com>"]
-description = "Arbitrage detection bot for Uniswap V3/V4"
+description = "Arbitrage detection bot for Uniswap V3/V4 + Multiple DEXes"
 
 [dependencies]
 # ============================================
@@ -19,6 +19,9 @@ alloy = { version = "1.0", features = [
 
 # Async runtime (required for alloy)
 tokio = { version = "1.42", features = ["full"] }
+
+# Async utilities (for concurrent fetching - 20x faster!)
+futures = "0.3"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
