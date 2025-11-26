@@ -1,11 +1,8 @@
 //! Graph Construction - DECIMAL-AWARE Edition
 //!
 //! Step 1.2: The Map Maker
-//!
-//! Now with SANITY CHECKS to catch invalid prices before they
-//! create "trillion dollar" arbitrage cycles.
 
-use alloy::primitives::Address;
+use alloy_primitives::Address;
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef;
 use std::collections::HashMap;
@@ -75,13 +72,12 @@ impl ArbitrageGraph {
         graph
     }
 
-    /// Add a pool to the graph. Returns false if price is invalid.
     pub fn add_pool(&mut self, pool: &PoolState) -> bool {
         if pool.liquidity == 0 {
             return false;
         }
 
-        if matches!(pool.pool_type, PoolType::V2 | PoolType::Balancer | PoolType::Curve) 
+        if matches!(pool.pool_type, PoolType::V2 | PoolType::Balancer) 
             && pool.reserve1 == 0 
         {
             return false;
@@ -90,32 +86,14 @@ impl ArbitrageGraph {
         let node0 = self.get_or_create_node(pool.token0);
         let node1 = self.get_or_create_node(pool.token1);
 
-        // Get NORMALIZED price (decimal-adjusted!)
         let raw_price = pool.raw_price();
         
-        // ============================================
-        // CRITICAL SANITY CHECKS
-        // ============================================
-        
-        // 1. Price must be positive and finite
         if raw_price <= 0.0 || !raw_price.is_finite() {
             return false;
         }
         
-        // 2. Price should be "reasonable" - not trillions or near-zero
-        // For most trading pairs, price should be between 1e-12 and 1e12
-        // Examples of valid prices:
-        // - WETH/USDC: ~3000 (within range)
-        // - WBTC/WETH: ~18 (within range)
-        // - SHIB/WETH: ~0.000000008 (within range)
-        // - DAI/USDC: ~1.0 (within range)
-        //
-        // Invalid prices (decimal bug indicators):
-        // - 1e12 or higher = likely decimal mismatch
-        // - 1e-15 or lower = likely decimal mismatch
-        
-        const MAX_REASONABLE_PRICE: f64 = 1e9;   // 1 billion
-        const MIN_REASONABLE_PRICE: f64 = 1e-12; // 0.000000000001
+        const MAX_REASONABLE_PRICE: f64 = 1e9;
+        const MIN_REASONABLE_PRICE: f64 = 1e-12;
         
         if raw_price > MAX_REASONABLE_PRICE {
             warn!(
@@ -133,14 +111,11 @@ impl ArbitrageGraph {
             return false;
         }
         
-        // Fee rate (e.g., 3000 = 0.3% = 0.003)
         let fee_rate = pool.fee as f64 / 1_000_000.0;
         
-        // Effective prices after fees
         let effective_price_0_to_1 = raw_price * (1.0 - fee_rate);
         let effective_price_1_to_0 = (1.0 / raw_price) * (1.0 - fee_rate);
 
-        // Add edges with -log(price) weights
         if effective_price_0_to_1 > 0.0 && effective_price_0_to_1.ln().is_finite() {
             self.graph.add_edge(
                 node0,
@@ -203,7 +178,6 @@ impl ArbitrageGraph {
         self.graph.edge_count()
     }
 
-    /// Find cross-DEX arbitrage opportunities
     pub fn find_cross_dex_opportunities(&self, token_symbols: &HashMap<Address, &str>) -> Vec<(Address, Address, Dex, Dex, f64)> {
         let mut opportunities = Vec::new();
         
@@ -228,7 +202,7 @@ impl ArbitrageGraph {
                     if e1.dex != e2.dex {
                         let price_diff = ((e1.price / e2.price) - 1.0).abs() * 100.0;
                         
-                        if price_diff > 0.01 && price_diff < 50.0 {  // Added upper bound sanity check
+                        if price_diff > 0.01 && price_diff < 50.0 {
                             opportunities.push((*from, *to, e1.dex, e2.dex, price_diff));
                         }
                     }

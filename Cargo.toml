@@ -10,12 +10,15 @@ description = "Arbitrage detection bot for Uniswap V3/V4 + Multiple DEXes"
 # PHASE 1: The Cartographer (Data Ingest)
 # ============================================
 
-# Ethereum interaction (replaces deprecated ethers-rs)
-alloy = { version = "1.0", features = [
-    "full",           # All features for MVP simplicity
-    "provider-http",  # HTTP RPC connections
-    "rpc-types",      # Ethereum RPC type definitions
-] }
+# Ethereum interaction - individual crates for version control
+alloy-primitives = "1.0"
+alloy-sol-types = "1.0"
+alloy-provider = { version = "1.0", features = ["reqwest"] }
+alloy-transport = "1.0"
+alloy-transport-http = "1.0"
+alloy-rpc-types = "1.0"
+alloy-eips = "1.0"
+alloy-network = "1.0"
 
 # Async runtime (required for alloy)
 tokio = { version = "1.42", features = ["full"] }
@@ -35,14 +38,9 @@ serde_json = "1.0"
 petgraph = "0.8"
 
 # ============================================
-# PHASE 3: The Simulator (EVM Simulation)
+# PHASE 3: The Simulator (Provider-based)
 # ============================================
-
-# Local EVM simulation (fork mainnet state)
-revm = { version = "30", features = [
-    "std",
-    "alloydb",  # Connect revm to alloy's database
-] }
+# Using alloy Provider's call() instead of REVM for simpler, more stable simulation
 
 # ============================================
 # UTILITIES
@@ -51,6 +49,7 @@ revm = { version = "30", features = [
 # Error handling
 eyre = "0.6"
 color-eyre = "0.6"
+anyhow = "1.0"
 
 # Logging
 tracing = "0.1"
@@ -65,6 +64,9 @@ clap = { version = "4.5", features = ["derive"] }
 # Pretty console output
 console = "0.15"
 indicatif = "0.17"  # Progress bars
+
+# Hex encoding
+hex = "0.4"
 
 [dev-dependencies]
 # Testing utilities

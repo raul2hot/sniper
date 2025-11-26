@@ -2,7 +2,7 @@
 //!
 //! Step 2.1: The Pathfinder
 
-use alloy::primitives::Address;
+use alloy_primitives::Address;
 use petgraph::graph::NodeIndex;
 use petgraph::visit::EdgeRef;
 use std::collections::{HashMap, HashSet};
@@ -23,17 +23,14 @@ pub struct ArbitrageCycle {
 }
 
 impl ArbitrageCycle {
-    /// Calculate profit percentage (before gas)
     pub fn profit_percentage(&self) -> f64 {
         (self.expected_return - 1.0) * 100.0
     }
     
-    /// Number of hops in the cycle
     pub fn hop_count(&self) -> usize {
         self.path.len().saturating_sub(1)
     }
     
-    /// Check if this is a cross-DEX arbitrage (uses multiple DEXes)
     pub fn is_cross_dex(&self) -> bool {
         if self.dexes.is_empty() {
             return false;
@@ -42,12 +39,10 @@ impl ArbitrageCycle {
         self.dexes.iter().any(|d| *d != first)
     }
     
-    /// Get a string showing the DEX path
     pub fn dex_path(&self) -> String {
         self.dexes.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(" → ")
     }
     
-    /// Get the average fee across the path (in bps)
     pub fn avg_fee_bps(&self) -> f64 {
         if self.fees.is_empty() {
             return 0.0;
@@ -55,12 +50,10 @@ impl ArbitrageCycle {
         self.fees.iter().map(|&f| f as f64).sum::<f64>() / self.fees.len() as f64 / 100.0
     }
     
-    /// Check if this uses any low-fee pools (≤5bps)
     pub fn has_low_fee_pools(&self) -> bool {
         self.fees.iter().any(|&f| f <= 500)
     }
     
-    /// Count unique DEXes in the path
     pub fn unique_dex_count(&self) -> usize {
         let unique: HashSet<_> = self.dexes.iter().collect();
         unique.len()
@@ -78,7 +71,6 @@ impl<'a> BoundedBellmanFord<'a> {
         Self { graph, max_hops }
     }
 
-    /// Find all arbitrage cycles starting from a given token
     pub fn find_cycles_from(&self, start_token: Address) -> Vec<ArbitrageCycle> {
         let mut cycles = Vec::new();
 
@@ -232,7 +224,6 @@ impl<'a> BoundedBellmanFord<'a> {
         })
     }
 
-    /// Find all arbitrage cycles starting from multiple base tokens
     pub fn find_all_cycles(&self, base_tokens: &[Address]) -> Vec<ArbitrageCycle> {
         let mut all_cycles = Vec::new();
         let mut seen_paths: HashSet<String> = HashSet::new();
@@ -271,7 +262,6 @@ impl<'a> BoundedBellmanFord<'a> {
     }
 }
 
-/// Helper to format a cycle path with token symbols
 pub fn format_cycle_path(cycle: &ArbitrageCycle, symbols: &HashMap<Address, &str>) -> String {
     cycle
         .path

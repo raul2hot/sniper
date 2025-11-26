@@ -1,11 +1,8 @@
 //! Profit Filter - SANITY-CHECKED Edition
 //!
 //! Step 2.2: The Filter
-//!
-//! Now with SANITY CHECKS to flag cycles with unrealistic returns
-//! (anything claiming >100% profit is likely a bug, not an opportunity)
 
-use alloy::primitives::Address;
+use alloy_primitives::Address;
 use console::style;
 use std::collections::HashMap;
 use tracing::{debug, info, warn};
@@ -22,7 +19,6 @@ pub struct ProfitAnalysis {
     pub gas_cost_usd: f64,
     pub net_profit_usd: f64,
     pub is_profitable: bool,
-    /// Flag if this cycle looks suspicious (unrealistic returns)
     pub is_suspicious: bool,
 }
 
@@ -102,16 +98,9 @@ impl ProfitFilter {
         let net_profit_usd = gross_profit_usd - gas_cost_usd;
         let is_profitable = net_profit_usd >= self.min_profit_usd;
         
-        // ============================================
-        // SANITY CHECK: Flag unrealistic returns
-        // ============================================
-        // Real arbitrage opportunities are typically 0.01% - 5%
-        // Anything claiming >50% return is almost certainly a bug
-        // Anything claiming >1000x is DEFINITELY a bug (decimal issues)
-        
-        let is_suspicious = cycle.expected_return > 1.5  // >50% return is suspicious
-            || cycle.expected_return > 10.0              // >1000% is definitely wrong
-            || gross_profit_usd.abs() > 1_000_000.0;     // >$1M profit is suspicious
+        let is_suspicious = cycle.expected_return > 1.5
+            || cycle.expected_return > 10.0
+            || gross_profit_usd.abs() > 1_000_000.0;
 
         ProfitAnalysis {
             cycle: cycle.clone(),
@@ -136,7 +125,6 @@ impl ProfitFilter {
         for cycle in cycles {
             let analysis = self.analyze(cycle, None);
             
-            // Skip suspicious cycles (likely bugs)
             if analysis.is_suspicious {
                 suspicious_count += 1;
                 let path = analysis.format_path(symbols);
@@ -219,7 +207,6 @@ impl ProfitFilter {
             return;
         }
 
-        // Filter out suspicious cycles first
         let valid_cycles: Vec<_> = cycles.iter()
             .filter(|c| {
                 let analysis = self.analyze(c, None);

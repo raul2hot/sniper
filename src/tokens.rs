@@ -1,6 +1,6 @@
 //! Token definitions for The Sniper
 
-use alloy::primitives::Address;
+use alloy_primitives::Address;
 use std::str::FromStr;
 
 /// Represents a token we're tracking
