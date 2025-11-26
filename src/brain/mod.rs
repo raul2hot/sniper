@@ -3,6 +3,7 @@
 //! Responsible for:
 //! - Finding negative cycles (arbitrage opportunities) using Bellman-Ford
 //! - Filtering out dust profits that won't cover gas
+//! - Detecting cross-DEX arbitrage opportunities!
 //!
 //! Submodules:
 //! - `bellman_ford`: Bounded Bellman-Ford implementation (max 4 hops)

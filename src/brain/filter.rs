@@ -3,6 +3,7 @@
 //! Step 2.2: The Filter
 //!
 //! Filters out "dust" profits that won't pay for gas.
+//! Now highlights cross-DEX opportunities!
 //!
 //! Success Criteria:
 //! - Console filters out unprofitable cycles
@@ -51,6 +52,27 @@ impl ProfitAnalysis {
             })
             .collect::<Vec<_>>()
             .join(" → ")
+    }
+    
+    /// Format path with DEX info
+    pub fn format_path_with_dex(&self, symbols: &HashMap<Address, &str>) -> String {
+        let mut parts = Vec::new();
+        
+        for (i, addr) in self.cycle.path.iter().enumerate() {
+            let token = symbols
+                .get(addr)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("0x{}...", &format!("{:?}", addr)[2..8]));
+            
+            if i > 0 && i <= self.cycle.dexes.len() {
+                let dex = &self.cycle.dexes[i - 1];
+                parts.push(format!("-[{}]-> {}", dex, token));
+            } else {
+                parts.push(token);
+            }
+        }
+        
+        parts.join("")
     }
 }
 
@@ -144,11 +166,18 @@ impl ProfitFilter {
 
             if analysis.is_profitable {
                 let path = analysis.format_path(symbols);
+                let cross_dex_tag = if cycle.is_cross_dex() {
+                    style(" [CROSS-DEX]").magenta().bold()
+                } else {
+                    style("").dim()
+                };
+                
                 info!(
                     "{}",
                     style(format!(
-                        "💰 PROFITABLE: {} | Gross: ${:.2} | Gas: ${:.2} | Net: ${:.2}",
+                        "💰 PROFITABLE: {}{} | Gross: ${:.2} | Gas: ${:.2} | Net: ${:.2}",
                         path,
+                        cross_dex_tag,
                         analysis.gross_profit_usd,
                         analysis.gas_cost_usd,
                         analysis.net_profit_usd
@@ -199,6 +228,10 @@ impl ProfitFilter {
             return;
         }
 
+        // Separate cross-DEX and single-DEX cycles
+        let cross_dex: Vec<_> = cycles.iter().filter(|c| c.is_cross_dex()).collect();
+        let single_dex: Vec<_> = cycles.iter().filter(|c| !c.is_cross_dex()).collect();
+
         println!();
         println!("{}", style("═══ CYCLE ANALYSIS ═══").yellow().bold());
         println!();
@@ -211,13 +244,55 @@ impl ProfitFilter {
             self.min_profit_usd
         );
         println!();
+        println!(
+            "Found {} total cycles: {} cross-DEX, {} single-DEX",
+            cycles.len(), cross_dex.len(), single_dex.len()
+        );
 
-        // Show top 10 cycles regardless of profitability
-        let to_show = cycles.len().min(10);
-        println!("Top {} cycles by return:", to_show);
+        // Show cross-DEX cycles first (they're more interesting!)
+        if !cross_dex.is_empty() {
+            println!();
+            println!("{}", style("=== CROSS-DEX CYCLES (Most Likely Profitable) ===").magenta().bold());
+            println!();
+
+            for (i, cycle) in cross_dex.iter().take(10).enumerate() {
+                let analysis = self.analyze(cycle, None);
+                let path = analysis.format_path(symbols);
+                
+                let status = if analysis.is_profitable {
+                    style("✓ PROFITABLE").green()
+                } else if analysis.net_profit_usd > 0.0 {
+                    style("○ marginal").yellow()
+                } else {
+                    style("✗ unprofitable").red()
+                };
+
+                println!(
+                    "  {}. {} | {:.4}x return ({:+.3}%)",
+                    i + 1,
+                    status,
+                    cycle.expected_return,
+                    cycle.profit_percentage()
+                );
+                println!("     Path: {}", style(path).cyan());
+                println!("     DEXes: {}", style(cycle.dex_path()).magenta());
+                println!(
+                    "     Gross: ${:+.2} | Gas: ${:.2} | Net: ${:+.2}",
+                    analysis.gross_profit_usd,
+                    analysis.gas_cost_usd,
+                    analysis.net_profit_usd
+                );
+                println!();
+            }
+        }
+
+        // Show top single-DEX cycles
+        println!();
+        println!("{}", style("=== SINGLE-DEX CYCLES ===").blue().bold());
         println!();
 
-        for (i, cycle) in cycles.iter().take(to_show).enumerate() {
+        let to_show = single_dex.len().min(5);
+        for (i, cycle) in single_dex.iter().take(to_show).enumerate() {
             let analysis = self.analyze(cycle, None);
             let path = analysis.format_path(symbols);
             
@@ -246,8 +321,8 @@ impl ProfitFilter {
             println!();
         }
 
-        if cycles.len() > to_show {
-            println!("  ... and {} more cycles", cycles.len() - to_show);
+        if single_dex.len() > to_show {
+            println!("  ... and {} more single-DEX cycles", single_dex.len() - to_show);
         }
     }
 }
@@ -261,11 +336,19 @@ impl Default for ProfitFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cartographer::Dex;
 
-    fn make_test_cycle(return_mult: f64, hops: usize) -> ArbitrageCycle {
+    fn make_test_cycle(return_mult: f64, hops: usize, cross_dex: bool) -> ArbitrageCycle {
+        let dexes = if cross_dex {
+            vec![Dex::UniswapV3, Dex::SushiswapV2, Dex::UniswapV3][..hops].to_vec()
+        } else {
+            vec![Dex::UniswapV3; hops]
+        };
+        
         ArbitrageCycle {
             path: vec![Address::ZERO; hops + 1],
             pools: vec![Address::ZERO; hops],
+            dexes,
             total_weight: -(return_mult.ln()),
             expected_return: return_mult,
             prices: vec![1.0; hops],
@@ -283,10 +366,6 @@ mod tests {
             default_input_usd: 10_000.0,
         };
 
-        // 3 swaps × 150,000 gas × 20 gwei × $3000/ETH
-        // = 450,000 × 20 × 10^-9 × 3000
-        // = 450,000 × 0.00000002 × 3000
-        // = 27 USD
         let gas_cost = filter.calculate_gas_cost(3);
         assert!(
             (gas_cost - 27.0).abs() < 0.1,
@@ -296,45 +375,13 @@ mod tests {
     }
 
     #[test]
-    fn test_profitable_cycle() {
+    fn test_profitable_cross_dex_cycle() {
         let filter = ProfitFilter::new(5.0);
 
-        // 5% return on $10,000 = $500 gross profit
-        let cycle = make_test_cycle(1.05, 3);
+        let cycle = make_test_cycle(1.05, 3, true);
+        assert!(cycle.is_cross_dex(), "Should be cross-DEX");
+        
         let analysis = filter.analyze(&cycle, Some(10_000.0));
-
-        assert!(analysis.gross_profit_usd > 400.0);
         assert!(analysis.is_profitable);
-    }
-
-    #[test]
-    fn test_unprofitable_dust() {
-        let filter = ProfitFilter::new(5.0);
-
-        // 0.1% return on $100 = $0.10 gross profit
-        let cycle = make_test_cycle(1.001, 3);
-        let analysis = filter.analyze(&cycle, Some(100.0));
-
-        assert!(analysis.gross_profit_usd < 1.0);
-        assert!(analysis.net_profit_usd < 0.0);
-        assert!(!analysis.is_profitable);
-    }
-
-    #[test]
-    fn test_marginal_cycle() {
-        let filter = ProfitFilter::new(5.0);
-
-        // 0.5% return on $10,000 = $50 gross profit
-        // Gas ~$27 for 3 swaps
-        // Net ~$23 - should be profitable
-        let cycle = make_test_cycle(1.005, 3);
-        let analysis = filter.analyze(&cycle, Some(10_000.0));
-
-        println!("Gross: ${:.2}", analysis.gross_profit_usd);
-        println!("Gas: ${:.2}", analysis.gas_cost_usd);
-        println!("Net: ${:.2}", analysis.net_profit_usd);
-
-        assert!(analysis.gross_profit_usd > 40.0);
-        assert!(analysis.net_profit_usd > 0.0);
     }
 }

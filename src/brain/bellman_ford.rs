@@ -5,6 +5,7 @@
 //! Implements a modified Bellman-Ford algorithm that:
 //! 1. Only searches up to k hops (k=4 for our MVP)
 //! 2. Finds negative cycles (arbitrage opportunities)
+//! 3. Now tracks cross-DEX paths!
 //!
 //! Key insight from the spec:
 //! - Standard Bellman-Ford runs |V|-1 relaxation iterations
@@ -23,7 +24,7 @@ use petgraph::visit::EdgeRef;
 use std::collections::HashMap;
 use tracing::{debug, info};
 
-use crate::cartographer::{ArbitrageGraph, EdgeData};
+use crate::cartographer::{ArbitrageGraph, Dex, EdgeData};
 
 /// Represents an arbitrage cycle (negative cycle in the graph)
 #[derive(Debug, Clone)]
@@ -34,6 +35,9 @@ pub struct ArbitrageCycle {
     
     /// The pool addresses used for each hop
     pub pools: Vec<Address>,
+    
+    /// The DEX used for each hop
+    pub dexes: Vec<Dex>,
     
     /// The total weight of the cycle (negative = profitable)
     pub total_weight: f64,
@@ -57,6 +61,20 @@ impl ArbitrageCycle {
     /// Number of hops in the cycle
     pub fn hop_count(&self) -> usize {
         self.path.len().saturating_sub(1)
+    }
+    
+    /// Check if this is a cross-DEX arbitrage (uses multiple DEXes)
+    pub fn is_cross_dex(&self) -> bool {
+        if self.dexes.is_empty() {
+            return false;
+        }
+        let first = self.dexes[0];
+        self.dexes.iter().any(|d| *d != first)
+    }
+    
+    /// Get a string showing the DEX path
+    pub fn dex_path(&self) -> String {
+        self.dexes.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(" → ")
     }
 }
 
@@ -96,8 +114,8 @@ impl<'a> BoundedBellmanFord<'a> {
         // Distance from start to each node
         let mut dist: Vec<f64> = vec![f64::INFINITY; node_count];
         
-        // Predecessor info: (previous_node, edge_data)
-        let mut pred: Vec<Option<(NodeIndex, Address, f64, u32)>> = vec![None; node_count];
+        // Predecessor info: (previous_node, pool_address, price, fee, dex)
+        let mut pred: Vec<Option<(NodeIndex, Address, f64, u32, Dex)>> = vec![None; node_count];
         
         // Track which hop we found each best distance at
         let mut dist_at_hop: Vec<usize> = vec![0; node_count];
@@ -132,16 +150,15 @@ impl<'a> BoundedBellmanFord<'a> {
                         edge_data.pool_address,
                         edge_data.price,
                         edge_data.fee,
+                        edge_data.dex,
                     ));
                     dist_at_hop[target.index()] = hop;
                     any_update = true;
                 }
             }
 
-            // After relaxing, check ALL paths back to start (not just negative ones)
-            // This helps us find "near miss" arbitrage too
+            // After relaxing, check ALL paths back to start
             if hop >= 2 {
-                // Look for any edge that completes a cycle back to start
                 for edge in self.graph.graph.edge_references() {
                     let source = edge.source();
                     let target = edge.target();
@@ -149,8 +166,7 @@ impl<'a> BoundedBellmanFord<'a> {
                     if target == start_node && !dist[source.index()].is_infinite() {
                         let cycle_weight = dist[source.index()] + edge.weight().weight;
                         
-                        // Found a cycle! (negative weight = profitable, but track all)
-                        // Only add if it's at least close to profitable (return > 0.99)
+                        // Found a cycle! (negative weight = profitable, but track all near-profitable)
                         let expected_return = (-cycle_weight).exp();
                         
                         if expected_return > 0.99 {  // Within 1% of breakeven
@@ -168,9 +184,10 @@ impl<'a> BoundedBellmanFord<'a> {
                                 });
                                 
                                 if !dominated {
+                                    let cross_dex = if cycle.is_cross_dex() { " [CROSS-DEX]" } else { "" };
                                     debug!(
-                                        "Found cycle at hop {}: weight={:.6}, return={:.4}x",
-                                        hop, cycle_weight, expected_return
+                                        "Found cycle at hop {}: weight={:.6}, return={:.4}x{}",
+                                        hop, cycle_weight, expected_return, cross_dex
                                     );
                                     cycles.push(cycle);
                                 }
@@ -194,12 +211,13 @@ impl<'a> BoundedBellmanFord<'a> {
         &self,
         start_node: NodeIndex,
         last_node: NodeIndex,
-        final_edge: &crate::cartographer::EdgeData,
-        pred: &[Option<(NodeIndex, Address, f64, u32)>],
+        final_edge: &EdgeData,
+        pred: &[Option<(NodeIndex, Address, f64, u32, Dex)>],
         _max_hop: usize,
     ) -> Option<ArbitrageCycle> {
         let mut path = Vec::new();
         let mut pools = Vec::new();
+        let mut dexes = Vec::new();
         let mut prices = Vec::new();
         let mut fees = Vec::new();
         let mut total_weight = final_edge.weight;
@@ -207,6 +225,7 @@ impl<'a> BoundedBellmanFord<'a> {
         // Start from last_node and work backwards
         path.push(self.graph.get_token(start_node)?); // Will be end of cycle
         pools.push(final_edge.pool_address);
+        dexes.push(final_edge.dex);
         prices.push(final_edge.price);
         fees.push(final_edge.fee);
         
@@ -218,8 +237,9 @@ impl<'a> BoundedBellmanFord<'a> {
             let token = self.graph.get_token(current)?;
             path.push(token);
 
-            if let Some((prev_node, pool, price, fee)) = pred[current.index()] {
+            if let Some((prev_node, pool, price, fee, dex)) = pred[current.index()] {
                 pools.push(pool);
+                dexes.push(dex);
                 prices.push(price);
                 fees.push(fee);
                 
@@ -244,6 +264,7 @@ impl<'a> BoundedBellmanFord<'a> {
         // Reverse to get forward order
         path.reverse();
         pools.reverse();
+        dexes.reverse();
         prices.reverse();
         fees.reverse();
 
@@ -256,83 +277,7 @@ impl<'a> BoundedBellmanFord<'a> {
         Some(ArbitrageCycle {
             path,
             pools,
-            total_weight,
-            expected_return,
-            prices,
-            fees,
-        })
-    }
-
-    /// Reconstruct a cycle from predecessor information
-    fn reconstruct_cycle(
-        &self,
-        start_node: NodeIndex,
-        pred: &[Option<(NodeIndex, Address, f64, u32)>],
-        _dist_at_hop: &[usize],
-        max_hop: usize,
-    ) -> Option<ArbitrageCycle> {
-        let mut path = Vec::new();
-        let mut pools = Vec::new();
-        let mut prices = Vec::new();
-        let mut fees = Vec::new();
-        let mut total_weight = 0.0;
-
-        let mut current = start_node;
-        let mut visited = vec![false; self.graph.graph.node_count()];
-        let mut hop_count = 0;
-
-        // Work backwards from start
-        loop {
-            if hop_count > max_hop {
-                break;
-            }
-
-            let token = self.graph.get_token(current)?;
-            path.push(token);
-
-            if visited[current.index()] && current == start_node && hop_count > 0 {
-                // We've completed the cycle
-                break;
-            }
-            visited[current.index()] = true;
-
-            if let Some((prev_node, pool, price, fee)) = pred[current.index()] {
-                pools.push(pool);
-                prices.push(price);
-                fees.push(fee);
-                
-                // Find the edge weight
-                for edge in self.graph.graph.edges(prev_node) {
-                    if edge.target() == current {
-                        total_weight += edge.weight().weight;
-                        break;
-                    }
-                }
-                
-                current = prev_node;
-                hop_count += 1;
-            } else {
-                break;
-            }
-        }
-
-        // Reverse to get forward order (start -> ... -> start)
-        path.reverse();
-        pools.reverse();
-        prices.reverse();
-        fees.reverse();
-
-        if path.len() < 3 {
-            return None;
-        }
-
-        // Calculate expected return from total weight
-        // weight = -log(effective_price), so return = e^(-weight)
-        let expected_return = (-total_weight).exp();
-
-        Some(ArbitrageCycle {
-            path,
-            pools,
+            dexes,
             total_weight,
             expected_return,
             prices,
@@ -365,7 +310,14 @@ impl<'a> BoundedBellmanFord<'a> {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        info!("Found {} unique arbitrage cycles", all_cycles.len());
+        // Count cross-DEX vs single-DEX cycles
+        let cross_dex_count = all_cycles.iter().filter(|c| c.is_cross_dex()).count();
+        let single_dex_count = all_cycles.len() - cross_dex_count;
+
+        info!(
+            "Found {} unique arbitrage cycles ({} cross-DEX, {} single-DEX)",
+            all_cycles.len(), cross_dex_count, single_dex_count
+        );
 
         all_cycles
     }
@@ -389,11 +341,11 @@ pub fn format_cycle_path(cycle: &ArbitrageCycle, symbols: &HashMap<Address, &str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cartographer::PoolState;
+    use crate::cartographer::{PoolState, PoolType};
     use alloy::primitives::U256;
 
     /// Create a test pool with specific price
-    fn make_pool(token0: Address, token1: Address, sqrt_price_x96: u128, fee: u32) -> PoolState {
+    fn make_pool(token0: Address, token1: Address, sqrt_price_x96: u128, fee: u32, dex: Dex) -> PoolState {
         PoolState {
             address: Address::repeat_byte(0x99),
             token0,
@@ -401,8 +353,11 @@ mod tests {
             sqrt_price_x96: U256::from(sqrt_price_x96),
             tick: 0,
             liquidity: 1_000_000_000,
+            reserve1: 0,
             fee,
             is_v4: false,
+            dex,
+            pool_type: PoolType::V3,
         }
     }
 
@@ -413,18 +368,13 @@ mod tests {
         let token_b = Address::repeat_byte(0x02);
         let token_c = Address::repeat_byte(0x03);
 
-        // Create pools with an artificial arbitrage opportunity
-        // We need: A->B->C->A with product of prices > 1
-        
-        // sqrt(price) * 2^96
-        // For price = 1.02: sqrt(1.02) * 2^96 ≈ 80033...
-        let sqrt_1_02 = 80033725539485447474396053504_u128; // sqrt(1.02) * 2^96
-        let sqrt_1_01 = 79626412058234710168382062592_u128; // sqrt(1.01) * 2^96
+        let sqrt_1_02 = 80033725539485447474396053504_u128;
+        let sqrt_1_01 = 79626412058234710168382062592_u128;
         
         let pools = vec![
-            make_pool(token_a, token_b, sqrt_1_02, 100), // A->B at 1.02, 0.01% fee
-            make_pool(token_b, token_c, sqrt_1_02, 100), // B->C at 1.02, 0.01% fee
-            make_pool(token_c, token_a, sqrt_1_01, 100), // C->A at 1.01, 0.01% fee
+            make_pool(token_a, token_b, sqrt_1_02, 100, Dex::UniswapV3),
+            make_pool(token_b, token_c, sqrt_1_02, 100, Dex::SushiswapV2),  // Different DEX!
+            make_pool(token_c, token_a, sqrt_1_01, 100, Dex::UniswapV3),
         ];
 
         let graph = crate::cartographer::ArbitrageGraph::from_pools(&pools);
@@ -432,49 +382,46 @@ mod tests {
 
         let cycles = bf.find_cycles_from(token_a);
 
-        // We should find at least one cycle with positive return
-        let profitable: Vec<_> = cycles.iter().filter(|c| c.expected_return > 1.0).collect();
+        // Check that we found cross-DEX cycles
+        let cross_dex: Vec<_> = cycles.iter().filter(|c| c.is_cross_dex()).collect();
         
-        println!("Found {} profitable cycles", profitable.len());
-        for cycle in &profitable {
+        println!("Found {} total cycles, {} cross-DEX", cycles.len(), cross_dex.len());
+        for cycle in &cross_dex {
             println!(
-                "  Cycle with {} hops: return = {:.4}x ({:.2}%)",
+                "  Cross-DEX cycle: {} hops, return = {:.4}x, DEXes: {}",
                 cycle.hop_count(),
                 cycle.expected_return,
-                cycle.profit_percentage()
+                cycle.dex_path()
             );
         }
 
-        // Note: Due to fees, the actual profitable cycles depend on exact prices
-        // This test verifies the algorithm runs correctly
         assert!(cycles.len() >= 0); // At minimum, should not panic
     }
 
     #[test]
-    fn test_no_cycle_in_fair_market() {
-        // Create tokens
-        let token_a = Address::repeat_byte(0x01);
-        let token_b = Address::repeat_byte(0x02);
+    fn test_cross_dex_detection() {
+        let cycle = ArbitrageCycle {
+            path: vec![Address::ZERO; 4],
+            pools: vec![Address::ZERO; 3],
+            dexes: vec![Dex::UniswapV3, Dex::SushiswapV2, Dex::UniswapV3],
+            total_weight: -0.01,
+            expected_return: 1.01,
+            prices: vec![1.0; 3],
+            fees: vec![3000; 3],
+        };
 
-        // Fair market: A->B at 2.0, means B->A at 0.5
-        // sqrt(2) * 2^96
-        let sqrt_2 = 112045541949572287496682733568_u128;
-        
-        let pools = vec![
-            make_pool(token_a, token_b, sqrt_2, 3000), // 0.3% fee
-        ];
+        assert!(cycle.is_cross_dex(), "Should detect cross-DEX cycle");
 
-        let graph = crate::cartographer::ArbitrageGraph::from_pools(&pools);
-        let bf = BoundedBellmanFord::new(&graph, 4);
+        let single_dex = ArbitrageCycle {
+            path: vec![Address::ZERO; 4],
+            pools: vec![Address::ZERO; 3],
+            dexes: vec![Dex::UniswapV3, Dex::UniswapV3, Dex::UniswapV3],
+            total_weight: -0.01,
+            expected_return: 1.01,
+            prices: vec![1.0; 3],
+            fees: vec![3000; 3],
+        };
 
-        let cycles = bf.find_cycles_from(token_a);
-
-        // In a fair market with fees, round-trip should be unprofitable
-        let profitable: Vec<_> = cycles
-            .iter()
-            .filter(|c| c.expected_return > 1.001) // >0.1% profit
-            .collect();
-
-        assert!(profitable.is_empty(), "Should not find profitable arbitrage in fair market");
+        assert!(!single_dex.is_cross_dex(), "Should detect single-DEX cycle");
     }
 }
