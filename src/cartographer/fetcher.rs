@@ -166,6 +166,7 @@ pub struct PoolInfo {
     pub weight0: Option<f64>,
 }
 
+/// Get token decimals from address - EXPORTED for use by simulator
 pub fn get_token_decimals(address: &Address) -> u8 {
     let addr_lower = format!("{:?}", address).to_lowercase();
     

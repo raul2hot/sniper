@@ -6,9 +6,9 @@
 //! - 5 DEXes: Uniswap V3/V2, Sushiswap V2, PancakeSwap V3, Balancer V2
 //! - Low-fee pool priority (1bps, 5bps)
 //! - DECIMAL NORMALIZATION
-//! - REVM-based simulation for profit validation
+//! - FIXED: Token-aware simulation amounts (no more 100 billion USDC!)
 
-use alloy_primitives::{Address, U256};
+use alloy_primitives::Address;
 use color_eyre::eyre::Result;
 use console::style;
 use std::collections::HashMap;
@@ -38,7 +38,7 @@ fn print_banner() {
     );
     println!(
         "{}",
-        style("    5 DEXes | REVM Simulation | Profit Validation").cyan()
+        style("    5 DEXes | Token-Aware Simulation | Profit Validation").cyan()
     );
     println!(
         "{}",
@@ -256,12 +256,12 @@ async fn main() -> Result<()> {
     let profitable_candidates = filter.filter_profitable(&cycles, &token_symbols);
 
     // =============================================
-    // PHASE 3: THE SIMULATOR
+    // PHASE 3: THE SIMULATOR (FIXED!)
     // =============================================
     println!();
     println!(
         "{}",
-        style("═══ PHASE 3: THE SIMULATOR ═══").green().bold()
+        style("═══ PHASE 3: THE SIMULATOR (FIXED) ═══").green().bold()
     );
     println!();
 
@@ -270,7 +270,7 @@ async fn main() -> Result<()> {
     } else {
         println!(
             "{}",
-            style("Step 3.1: Initializing Provider-based simulator...").green()
+            style("Step 3.1: Initializing token-aware simulator...").green()
         );
         
         match SwapSimulator::new(&rpc_url).await {
@@ -278,7 +278,8 @@ async fn main() -> Result<()> {
                 swap_sim.set_eth_price(eth_price);
                 swap_sim.set_gas_price(20.0);
                 
-                println!("{} Simulator initialized", style("✓").green());
+                println!("{} Simulator initialized with token-aware amounts", style("✓").green());
+                println!("   (Using $10,000 equivalent per cycle, adjusted for token decimals)");
                 
                 // Take the top 10 cycles to simulate
                 let cycles_to_simulate: Vec<_> = if !profitable_candidates.is_empty() {
@@ -294,13 +295,14 @@ async fn main() -> Result<()> {
                         style(format!("Step 3.2: Simulating {} top cycles...", cycles_to_simulate.len())).green()
                     );
                     
-                    let input_amount = U256::from(100_000_000_000_000_000u128); // 0.1 ETH
+                    // FIXED: Use $10,000 USD equivalent, the simulator will adjust for token decimals
+                    let target_usd = 10_000.0;
                     
                     let mut sim_success = 0;
                     let mut sim_profitable = 0;
                     
                     for (i, cycle) in cycles_to_simulate.iter().enumerate() {
-                        let sim = swap_sim.simulate_cycle(cycle, input_amount).await;
+                        let sim = swap_sim.simulate_cycle(cycle, target_usd).await;
                         
                         let path = cycle.path.iter()
                             .map(|a| format_token(a, &token_symbols))
@@ -427,7 +429,7 @@ async fn main() -> Result<()> {
     );
     println!(
         "{}",
-        style(" ✅ PHASE 3 COMPLETE - SIMULATION ENABLED!").green().bold()
+        style(" ✅ PHASE 3 COMPLETE - TOKEN-AWARE SIMULATION!").green().bold()
     );
     println!(
         "{}",
@@ -439,7 +441,7 @@ async fn main() -> Result<()> {
     println!("  • Low-fee pools: {} (prioritized for tight arbs)", low_fee_count);
     println!("  • Cycles analyzed: {} ({} cross-DEX, {} w/ low fees)", 
              cycles.len(), cross_dex_count, low_fee_cycle_count);
-    println!("  • REVM simulation: ACTIVE");
+    println!("  • Simulation: TOKEN-AWARE (proper decimal handling)");
     println!();
     println!("The Sniper is ready for production!");
 
