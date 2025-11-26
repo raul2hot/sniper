@@ -8,7 +8,6 @@ use alloy_sol_types::{sol, SolCall};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types::TransactionRequest;
 use eyre::{eyre, Result};
-use std::sync::Arc;
 use tracing::debug;
 
 // ============================================

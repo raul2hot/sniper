@@ -276,31 +276,26 @@ impl PoolFetcher {
     }
 
     async fn fetch_v3_pool_inner(&self, pool_address: Address, dex: Dex) -> Result<PoolState> {
-        // Fetch slot0
         let slot0_calldata = IUniswapV3Pool::slot0Call {}.abi_encode();
         let slot0_result = self.call_contract(pool_address, slot0_calldata).await?;
         let slot0 = IUniswapV3Pool::slot0Call::abi_decode_returns(&slot0_result)
             .map_err(|e| eyre!("slot0 decode: {}", e))?;
         
-        // Fetch liquidity
         let liq_calldata = IUniswapV3Pool::liquidityCall {}.abi_encode();
         let liq_result = self.call_contract(pool_address, liq_calldata).await?;
         let liquidity = IUniswapV3Pool::liquidityCall::abi_decode_returns(&liq_result)
             .map_err(|e| eyre!("liquidity decode: {}", e))?;
         
-        // Fetch token0
         let t0_calldata = IUniswapV3Pool::token0Call {}.abi_encode();
         let t0_result = self.call_contract(pool_address, t0_calldata).await?;
         let token0 = IUniswapV3Pool::token0Call::abi_decode_returns(&t0_result)
             .map_err(|e| eyre!("token0 decode: {}", e))?;
         
-        // Fetch token1
         let t1_calldata = IUniswapV3Pool::token1Call {}.abi_encode();
         let t1_result = self.call_contract(pool_address, t1_calldata).await?;
         let token1 = IUniswapV3Pool::token1Call::abi_decode_returns(&t1_result)
             .map_err(|e| eyre!("token1 decode: {}", e))?;
         
-        // Fetch fee
         let fee_calldata = IUniswapV3Pool::feeCall {}.abi_encode();
         let fee_result = self.call_contract(pool_address, fee_calldata).await?;
         let fee = IUniswapV3Pool::feeCall::abi_decode_returns(&fee_result)
@@ -309,10 +304,7 @@ impl PoolFetcher {
         let token0_decimals = self.get_decimals(token0);
         let token1_decimals = self.get_decimals(token1);
 
-        // Convert U160 to u128 for sqrtPriceX96
         let sqrt_price: u128 = slot0.sqrtPriceX96.to();
-        
-        // Convert u24 fee to u32
         let fee_u32: u32 = fee.to();
 
         Ok(PoolState {
@@ -334,19 +326,16 @@ impl PoolFetcher {
     }
 
     async fn fetch_v2_pool_inner(&self, pool_address: Address, dex: Dex, fee: u32) -> Result<PoolState> {
-        // Fetch reserves
         let res_calldata = IUniswapV2Pair::getReservesCall {}.abi_encode();
         let res_result = self.call_contract(pool_address, res_calldata).await?;
         let reserves = IUniswapV2Pair::getReservesCall::abi_decode_returns(&res_result)
             .map_err(|e| eyre!("reserves decode: {}", e))?;
         
-        // Fetch token0
         let t0_calldata = IUniswapV2Pair::token0Call {}.abi_encode();
         let t0_result = self.call_contract(pool_address, t0_calldata).await?;
         let token0 = IUniswapV2Pair::token0Call::abi_decode_returns(&t0_result)
             .map_err(|e| eyre!("token0 decode: {}", e))?;
         
-        // Fetch token1
         let t1_calldata = IUniswapV2Pair::token1Call {}.abi_encode();
         let t1_result = self.call_contract(pool_address, t1_calldata).await?;
         let token1 = IUniswapV2Pair::token1Call::abi_decode_returns(&t1_result)
@@ -355,7 +344,6 @@ impl PoolFetcher {
         let token0_decimals = self.get_decimals(token0);
         let token1_decimals = self.get_decimals(token1);
 
-        // Convert u112 to u128
         let reserve0: u128 = reserves.reserve0.to();
         let reserve1: u128 = reserves.reserve1.to();
 

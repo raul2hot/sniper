@@ -9,7 +9,7 @@
 //! - Validating arbitrage cycles
 
 mod quoter;
-mod swap_simulator;
+pub mod swap_simulator;
 
 pub use quoter::UniV3Quoter;
 pub use swap_simulator::SwapSimulator;
