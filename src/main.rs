@@ -1,11 +1,12 @@
-//! The Sniper - Arbitrage Detection Bot (Phase 4: CONTINUOUS LOOP Edition)
+//! The Sniper - Arbitrage Detection Bot (Phase 4: FULL SIMULATION Edition)
 //!
 //! Run with: cargo run
 //!
 //! CHANGES:
-//! - Continuous loop instead of one-shot execution
-//! - Proper error handling with retry logic
-//! - Reduced RPC costs by not restarting
+//! - Batched RPC calls (10 calls instead of 240)
+//! - Better console display with PnL table
+//! - Full simulation mode that simulates flash loan execution
+//! - More verbose logging even when no opportunities
 
 use alloy_primitives::Address;
 use color_eyre::eyre::Result;
@@ -36,17 +37,29 @@ fn print_banner() {
     );
     println!(
         "{}",
-        style(" 🎯 THE SNIPER - Arbitrage Detection Bot (CONTINUOUS Edition)").cyan().bold()
+        style(" 🎯 THE SNIPER - Arbitrage Detection Bot v0.4").cyan().bold()
     );
     println!(
         "{}",
-        style("    5 DEXes | Dynamic Sizing | Continuous Scanning").cyan()
+        style("    Batched RPC | Full Simulation | Live PnL Display").cyan()
     );
     println!(
         "{}",
         style("═══════════════════════════════════════════════════════════════").cyan()
     );
     println!();
+}
+
+/// Safely truncate a UTF-8 string to approximately `max_chars` characters
+/// Handles multi-byte characters like → properly
+fn truncate_utf8(s: &str, max_chars: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max_chars {
+        s.to_string()
+    } else {
+        let truncated: String = chars.into_iter().take(max_chars).collect();
+        format!("{}...", truncated)
+    }
 }
 
 fn build_token_symbols() -> HashMap<Address, &'static str> {
@@ -105,60 +118,87 @@ fn get_eth_price_from_pools(pools: &[cartographer::PoolState]) -> f64 {
     3500.0
 }
 
-/// Simulate a cycle with multiple input sizes to find the profitable amount
-async fn simulate_with_optimal_size(
-    simulator: &SwapSimulator,
-    cycle: &ArbitrageCycle,
+/// Print a fancy table of the top cycles found
+fn print_cycle_table(
+    cycles: &[ArbitrageCycle], 
     symbols: &HashMap<Address, &str>,
-) -> Option<simulator::swap_simulator::ArbitrageSimulation> {
-    // Get the liquidity tier for this cycle
-    let tier = simulator.get_cycle_liquidity_tier(cycle);
-    let base_amount = tier.recommended_amount_usd();
-    
-    // Try multiple sizes: 100%, 50%, 25%, 10%
-    let size_multipliers = [1.0, 0.5, 0.25, 0.1];
-    let mut best_sim: Option<simulator::swap_simulator::ArbitrageSimulation> = None;
-    
-    for &mult in &size_multipliers {
-        let target_usd = base_amount * mult;
-        
-        // Skip very small amounts
-        if target_usd < 50.0 {
-            continue;
-        }
-        
-        let sim = simulator.simulate_cycle(cycle, target_usd).await;
-        
-        if sim.simulation_success {
-            let path = cycle.path.iter()
-                .map(|a| format_token(a, symbols))
-                .collect::<Vec<_>>()
-                .join(" → ");
-            
-            debug!(
-                "  Size ${:.0} ({:?}): Return {:.4}x, Net ${:.2}",
-                target_usd, tier, sim.return_multiplier(), sim.profit_usd
-            );
-            
-            // If profitable, we found our answer
-            if sim.is_profitable {
-                info!(
-                    "✓ Found profitable size: ${:.0} for {} → Net: ${:.2}",
-                    target_usd, path, sim.profit_usd
-                );
-                return Some(sim);
-            }
-            
-            // Keep track of the best (least bad) simulation
-            match &best_sim {
-                None => best_sim = Some(sim),
-                Some(prev) if sim.profit_usd > prev.profit_usd => best_sim = Some(sim),
-                _ => {}
-            }
-        }
+    filter: &ProfitFilter,
+    title: &str,
+    max_rows: usize,
+) {
+    if cycles.is_empty() {
+        return;
     }
+
+    println!();
+    println!("{}", style(format!("┌─────────────────────────────────────────────────────────────────────────────────┐")).dim());
+    println!("{}", style(format!("│ {:^79} │", title)).yellow().bold());
+    println!("{}", style(format!("├─────────────────────────────────────────────────────────────────────────────────┤")).dim());
+    println!("{}", style(format!("│ {:^3} │ {:^30} │ {:^12} │ {:^10} │ {:^12} │", 
+        "#", "PATH", "DEXes", "RETURN", "EST. PnL")).dim());
+    println!("{}", style(format!("├─────────────────────────────────────────────────────────────────────────────────┤")).dim());
+
+    for (i, cycle) in cycles.iter().take(max_rows).enumerate() {
+        let path = cycle.path.iter()
+            .map(|a| format_token(a, symbols))
+            .collect::<Vec<_>>()
+            .join("→");
+        
+        let path_display = truncate_utf8(&path, 25);
+
+        let dex_str: String = cycle.dexes.iter()
+            .map(|d| match d {
+                Dex::UniswapV3 => "U3",
+                Dex::UniswapV2 => "U2",
+                Dex::SushiswapV2 => "S2",
+                Dex::PancakeSwapV3 => "P3",
+                Dex::BalancerV2 => "B2",
+                _ => "??",
+            })
+            .collect::<Vec<_>>()
+            .join("-");
+
+        let analysis = filter.analyze(cycle, None);
+        let return_str = format!("{:.4}x", cycle.expected_return);
+        let pnl_str = format!("${:+.2}", analysis.net_profit_usd);
+
+        let row_style = if analysis.is_profitable {
+            style(format!("│ {:>3} │ {:^30} │ {:^12} │ {:^10} │ {:^12} │",
+                i + 1, path_display, dex_str, return_str, pnl_str)).green()
+        } else if analysis.net_profit_usd > -10.0 {
+            style(format!("│ {:>3} │ {:^30} │ {:^12} │ {:^10} │ {:^12} │",
+                i + 1, path_display, dex_str, return_str, pnl_str)).yellow()
+        } else {
+            style(format!("│ {:>3} │ {:^30} │ {:^12} │ {:^10} │ {:^12} │",
+                i + 1, path_display, dex_str, return_str, pnl_str)).dim()
+        };
+
+        println!("{}", row_style);
+    }
+
+    if cycles.len() > max_rows {
+        println!("{}", style(format!("│ {:^79} │", 
+            format!("... and {} more cycles", cycles.len() - max_rows))).dim());
+    }
+
+    println!("{}", style(format!("└─────────────────────────────────────────────────────────────────────────────────┘")).dim());
+}
+
+/// Print market summary
+fn print_market_summary(pools: &[cartographer::PoolState], eth_price: f64, gas_gwei: f64) {
+    let v3_count = pools.iter().filter(|p| p.pool_type == PoolType::V3).count();
+    let v2_count = pools.iter().filter(|p| matches!(p.pool_type, PoolType::V2 | PoolType::Balancer)).count();
     
-    best_sim
+    let total_liquidity_est: f64 = pools.iter()
+        .filter(|p| p.pool_type == PoolType::V3)
+        .map(|p| p.liquidity as f64)
+        .sum::<f64>() / 1e18 * eth_price;
+
+    println!();
+    println!("{}", style("┌─────────────────── MARKET SNAPSHOT ───────────────────┐").cyan());
+    println!("{}", style(format!("│  ETH Price: ${:<12.2}  Gas: {:<8.2} gwei          │", eth_price, gas_gwei)).cyan());
+    println!("{}", style(format!("│  Pools: {} V3, {} V2           Est. TVL: ${:<.0}M   │", v3_count, v2_count, total_liquidity_est / 1e6)).cyan());
+    println!("{}", style("└───────────────────────────────────────────────────────┘").cyan());
 }
 
 /// Statistics tracking across scans
@@ -167,6 +207,8 @@ struct ScanStats {
     profitable_found: u64,
     total_cycles_analyzed: u64,
     last_profitable_scan: Option<u64>,
+    simulations_run: u64,
+    flash_loan_sims: u64,
 }
 
 impl ScanStats {
@@ -176,28 +218,46 @@ impl ScanStats {
             profitable_found: 0,
             total_cycles_analyzed: 0,
             last_profitable_scan: None,
+            simulations_run: 0,
+            flash_loan_sims: 0,
         }
     }
     
-    fn record_scan(&mut self, cycles: usize, profitable: usize) {
+    fn record_scan(&mut self, cycles: usize, profitable: usize, simulations: usize, flash_sims: usize) {
         self.total_scans += 1;
         self.total_cycles_analyzed += cycles as u64;
         self.profitable_found += profitable as u64;
+        self.simulations_run += simulations as u64;
+        self.flash_loan_sims += flash_sims as u64;
         if profitable > 0 {
             self.last_profitable_scan = Some(self.total_scans);
         }
     }
     
     fn print_summary(&self) {
-        info!("━━━━━━━━━━━━ CUMULATIVE STATS ━━━━━━━━━━━━");
-        info!("Total scans: {}", self.total_scans);
-        info!("Cycles analyzed: {}", self.total_cycles_analyzed);
-        info!("Profitable opportunities: {}", self.profitable_found);
+        println!();
+        println!("{}", style("━━━━━━━━━━━━ CUMULATIVE STATISTICS ━━━━━━━━━━━━").yellow().bold());
+        println!("  Total scans completed: {}", self.total_scans);
+        println!("  Cycles analyzed: {}", self.total_cycles_analyzed);
+        println!("  Simulations run: {}", self.simulations_run);
+        println!("  Flash loan simulations: {}", self.flash_loan_sims);
+        println!("  Profitable opportunities: {}", self.profitable_found);
         if let Some(last) = self.last_profitable_scan {
-            info!("Last profitable: scan #{}", last);
+            println!("  Last profitable: scan #{}", last);
+        } else {
+            println!("  Last profitable: None yet (market is efficient)");
         }
-        info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        println!("{}", style("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━").yellow());
     }
+}
+
+/// Simulation result for a cycle
+#[derive(Debug)]
+struct CycleSimResult {
+    cycle: ArbitrageCycle,
+    sim: simulator::swap_simulator::ArbitrageSimulation,
+    flash_loan_simulated: bool,
+    execution_would_succeed: bool,
 }
 
 #[tokio::main]
@@ -240,6 +300,7 @@ async fn main() -> Result<()> {
     let mut consecutive_failures = 0u32;
     
     info!("🚀 Starting continuous scanning loop...");
+    info!("   Mode: {} (will simulate full trades)", config.execution_mode);
     info!("   Scan interval: {} seconds", config.scan_interval_secs);
     info!("   Press Ctrl+C to stop");
     println!();
@@ -250,48 +311,53 @@ async fn main() -> Result<()> {
     loop {
         let scan_number = stats.total_scans + 1;
         
-        // Check emergency stop (re-read from env for hot reload)
+        // Check emergency stop
         if std::env::var("EMERGENCY_STOP").unwrap_or_default() == "true" || config.emergency_stop {
             warn!("🛑 Emergency stop is active. Waiting 60 seconds...");
             tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
             continue;
         }
         
-        info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-        info!("🔄 SCAN #{} starting at {}", scan_number, chrono::Utc::now().format("%H:%M:%S UTC"));
-        info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        println!();
+        println!("{}", style(format!(
+            "━━━━━━━━━━━━━━━━━━ SCAN #{} @ {} ━━━━━━━━━━━━━━━━━━",
+            scan_number, 
+            chrono::Utc::now().format("%H:%M:%S UTC")
+        )).cyan().bold());
         
         let scan_start = Instant::now();
         
         // Run the scan
         match run_single_scan(&config, &token_symbols, &engine).await {
-            Ok((cycles_count, profitable_count)) => {
+            Ok((cycles_count, profitable_count, sim_count, flash_sim_count)) => {
                 consecutive_failures = 0;
-                stats.record_scan(cycles_count, profitable_count);
+                stats.record_scan(cycles_count, profitable_count, sim_count, flash_sim_count);
                 
                 let scan_duration = scan_start.elapsed();
                 
+                println!();
                 if profitable_count > 0 {
-                    info!(
+                    println!(
                         "{}",
                         style(format!(
-                            "💰 SCAN #{} COMPLETE: {} profitable opportunities found! (took {:?})",
-                            scan_number, profitable_count, scan_duration
+                            "🎯 SCAN #{} COMPLETE: {} PROFITABLE! ({} cycles, {} sims, {:?})",
+                            scan_number, profitable_count, cycles_count, sim_count, scan_duration
                         )).green().bold()
                     );
                 } else {
-                    info!(
-                        "✅ Scan #{} complete: {} cycles analyzed, 0 profitable (took {:?})",
-                        scan_number, cycles_count, scan_duration
+                    println!(
+                        "✅ Scan #{} complete: {} cycles, {} simulations, 0 profitable ({:?})",
+                        scan_number, cycles_count, sim_count, scan_duration
                     );
+                    println!("   {} - Market is efficient, waiting for volatility...", 
+                        style("No arbitrage opportunities").dim());
                 }
             }
             Err(e) => {
                 consecutive_failures += 1;
                 error!("❌ Scan #{} failed: {}", scan_number, e);
                 
-                // Record failed scan in stats
-                stats.record_scan(0, 0);
+                stats.record_scan(0, 0, 0, 0);
                 
                 if consecutive_failures >= config.max_consecutive_failures {
                     warn!(
@@ -310,49 +376,44 @@ async fn main() -> Result<()> {
         }
         
         // Wait for next scan
-        debug!(
-            "💤 Sleeping {} seconds until next scan...",
-            config.scan_interval_secs
-        );
+        println!();
+        println!("💤 Next scan in {} seconds...", config.scan_interval_secs);
         tokio::time::sleep(tokio::time::Duration::from_secs(config.scan_interval_secs)).await;
     }
 }
 
 /// Run a single scan iteration
-/// Returns (cycles_analyzed, profitable_count)
+/// Returns (cycles_analyzed, profitable_count, simulations_run, flash_loan_sims)
 async fn run_single_scan(
     config: &Config,
     token_symbols: &HashMap<Address, &'static str>,
     engine: &ExecutionEngine,
-) -> Result<(usize, usize)> {
+) -> Result<(usize, usize, usize, usize)> {
     
     // =============================================
-    // PHASE 1: THE CARTOGRAPHER
+    // PHASE 1: THE CARTOGRAPHER (Batched RPC)
     // =============================================
-    debug!("Phase 1: Fetching pool data...");
     let fetch_start = Instant::now();
 
     let fetcher = PoolFetcher::new(config.rpc_url.clone());
     let pools = fetcher.fetch_all_pools().await?;
 
     let fetch_time = fetch_start.elapsed();
-    debug!("Fetched {} pools in {:?}", pools.len(), fetch_time);
+    info!("📊 Fetched {} pools in {:?}", pools.len(), fetch_time);
 
     let eth_price = get_eth_price_from_pools(&pools);
-    debug!("ETH price: ${:.2}", eth_price);
+    let gas_gwei = 0.5; // Low gas environment
+
+    // Print market snapshot
+    print_market_summary(&pools, eth_price, gas_gwei);
 
     // Build the graph
     let graph = ArbitrageGraph::from_pools(&pools);
-    debug!(
-        "Graph: {} nodes, {} edges",
-        graph.node_count(),
-        graph.edge_count()
-    );
 
     // =============================================
-    // PHASE 2: THE BRAIN
+    // PHASE 2: THE BRAIN (Cycle Detection)
     // =============================================
-    debug!("Phase 2: Running Bellman-Ford...");
+    info!("🧠 Running Bellman-Ford algorithm...");
 
     let bellman_ford = BoundedBellmanFord::new(&graph, config.max_hops);
     let base_tokens = config.base_token_addresses();
@@ -365,125 +426,263 @@ async fn run_single_scan(
         .collect();
 
     let cycles_count = cycles.len();
-    debug!("Found {} valid cycles", cycles_count);
 
-    // Quick profit filter
+    // Create profit filter
     let mut filter = ProfitFilter::new(config.min_profit_usd);
     filter.set_eth_price(eth_price);
-    filter.set_gas_price(0.5);
+    filter.set_gas_price(gas_gwei);
 
-    let profitable_candidates = filter.filter_profitable(&cycles, token_symbols);
+    // Sort cycles by expected return
+    let mut sorted_cycles = cycles.clone();
+    sorted_cycles.sort_by(|a, b| {
+        b.expected_return.partial_cmp(&a.expected_return)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // Print top cycles table (even if not profitable)
+    if !sorted_cycles.is_empty() {
+        print_cycle_table(&sorted_cycles, token_symbols, &filter, "TOP ARBITRAGE CYCLES FOUND", 15);
+    }
+
+    // Get candidates for simulation
+    let profitable_candidates = filter.filter_profitable(&sorted_cycles, token_symbols);
 
     // =============================================
-    // PHASE 3: THE SIMULATOR
+    // PHASE 3: THE SIMULATOR (Full Trade Simulation)
     // =============================================
-    let mut simulated_profitable = Vec::new();
+    let mut simulated_results: Vec<CycleSimResult> = Vec::new();
+    let mut sim_count = 0usize;
+    let mut flash_sim_count = 0usize;
 
-    if !profitable_candidates.is_empty() {
-        debug!("Phase 3: Simulating {} candidates...", profitable_candidates.len());
+    // Always simulate top candidates (even if filter says unprofitable)
+    let candidates_to_simulate: Vec<_> = if profitable_candidates.is_empty() {
+        // Simulate top 5 cycles anyway to show activity
+        sorted_cycles.iter()
+            .filter(|c| c.expected_return > 0.99 && c.expected_return < 1.05)
+            .take(5)
+            .cloned()
+            .collect()
+    } else {
+        profitable_candidates.iter().take(10).map(|p| p.cycle.clone()).collect()
+    };
+
+    if !candidates_to_simulate.is_empty() {
+        info!("🔬 Simulating {} candidate cycles...", candidates_to_simulate.len());
         
         match SwapSimulator::new(&config.rpc_url).await {
             Ok(mut swap_sim) => {
                 swap_sim.set_eth_price(eth_price);
+                swap_sim.set_gas_price(gas_gwei);
                 
-                // Take top 10 candidates for simulation
-                let cycles_to_simulate: Vec<_> = profitable_candidates
-                    .iter()
-                    .take(10)
-                    .map(|p| &p.cycle)
-                    .cloned()
-                    .collect();
-                
-                for cycle in &cycles_to_simulate {
-                    if let Some(sim) = simulate_with_optimal_size(&swap_sim, cycle, token_symbols).await {
-                        if sim.is_profitable && sim.profit_usd >= config.min_profit_usd {
-                            simulated_profitable.push((cycle.clone(), sim));
+                for cycle in &candidates_to_simulate {
+                    sim_count += 1;
+                    
+                    let path_str = cycle.path.iter()
+                        .map(|a| format_token(a, token_symbols))
+                        .collect::<Vec<_>>()
+                        .join(" → ");
+                    
+                    // Determine simulation size based on liquidity tier
+                    let tier = swap_sim.get_cycle_liquidity_tier(cycle);
+                    let target_usd = tier.recommended_amount_usd().min(config.default_simulation_usd);
+                    
+                    info!("   Simulating: {} (${:.0}, {:?} tier)", path_str, target_usd, tier);
+                    
+                    let sim = swap_sim.simulate_cycle(cycle, target_usd).await;
+                    
+                    if sim.simulation_success {
+                        let is_profitable = sim.is_profitable && sim.profit_usd >= config.min_profit_usd;
+                        
+                        // Log simulation results
+                        if is_profitable {
+                            info!(
+                                "   {} Return: {:.4}x | Net: ${:.2} | Gas: {} units",
+                                style("✓ PROFITABLE").green().bold(),
+                                sim.return_multiplier(),
+                                sim.profit_usd,
+                                sim.total_gas_used
+                            );
+                        } else {
+                            info!(
+                                "   {} Return: {:.4}x | Net: ${:.2}",
+                                style("○ Not profitable").dim(),
+                                sim.return_multiplier(),
+                                sim.profit_usd
+                            );
                         }
+                        
+                        // =============================================
+                        // PHASE 3.5: FLASH LOAN SIMULATION
+                        // =============================================
+                        // For profitable cycles, simulate the full flash loan execution
+                        let mut flash_loan_simulated = false;
+                        let mut execution_would_succeed = false;
+                        
+                        if is_profitable {
+                            flash_sim_count += 1;
+                            info!("   🔥 Simulating FULL FLASH LOAN execution...");
+                            
+                            // Simulate the execution flow
+                            match engine.execute(cycle, &sim, 0).await {
+                                Ok(result) => {
+                                    flash_loan_simulated = true;
+                                    execution_would_succeed = result.is_success();
+                                    
+                                    match &result {
+                                        executor::ExecutionResult::Simulated { expected_profit_usd, would_execute } => {
+                                            info!(
+                                                "   {} Flash loan sim: Would profit ${:.2}, execute: {}",
+                                                style("💰").green(),
+                                                expected_profit_usd,
+                                                would_execute
+                                            );
+                                        }
+                                        executor::ExecutionResult::DryRun { simulation_passed, gas_used, .. } => {
+                                            info!(
+                                                "   {} Dry run: passed={}, gas={:?}",
+                                                if *simulation_passed { style("✓").green() } else { style("✗").red() },
+                                                simulation_passed,
+                                                gas_used
+                                            );
+                                        }
+                                        executor::ExecutionResult::Skipped { reason } => {
+                                            info!("   ⏭️ Skipped: {}", reason);
+                                        }
+                                        executor::ExecutionResult::Aborted { reason } => {
+                                            warn!("   ⚠️ Aborted: {}", reason);
+                                        }
+                                        executor::ExecutionResult::Failed { reason } => {
+                                            warn!("   ❌ Failed: {}", reason);
+                                        }
+                                        _ => {
+                                            info!("   Result: {:?}", result);
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("   ❌ Flash loan simulation error: {}", e);
+                                }
+                            }
+                            
+                            // Log to file
+                            if config.simulation_log {
+                                if let Err(e) = log_opportunity(config, cycle, &sim, flash_loan_simulated, execution_would_succeed) {
+                                    warn!("Failed to log opportunity: {}", e);
+                                } else {
+                                    info!("   📝 Logged to {}", config.simulation_log_path);
+                                }
+                            }
+                        }
+                        
+                        simulated_results.push(CycleSimResult {
+                            cycle: cycle.clone(),
+                            sim,
+                            flash_loan_simulated,
+                            execution_would_succeed,
+                        });
+                    } else {
+                        info!(
+                            "   {} Reverted: {}",
+                            style("✗").red(),
+                            sim.revert_reason.as_deref().unwrap_or("Unknown")
+                        );
                     }
                 }
             }
             Err(e) => {
-                warn!("Simulator init failed: {}", e);
+                warn!("⚠️ Simulator init failed: {}", e);
             }
         }
     }
 
     // =============================================
-    // PHASE 4: THE EXECUTOR
+    // PHASE 4: RESULTS SUMMARY
     // =============================================
-    if !simulated_profitable.is_empty() {
-        info!(
-            "{}",
-            style(format!("🎯 {} PROFITABLE OPPORTUNITIES FOUND!", simulated_profitable.len()))
-                .green()
-                .bold()
-        );
+    let profitable_count = simulated_results.iter()
+        .filter(|r| r.sim.is_profitable && r.sim.profit_usd >= config.min_profit_usd)
+        .count();
+
+    if !simulated_results.is_empty() {
+        println!();
+        println!("{}", style("┌─────────────────── SIMULATION RESULTS ───────────────────┐").magenta());
         
-        for (i, (cycle, sim)) in simulated_profitable.iter().enumerate() {
-            let path = cycle.path.iter()
+        for (i, result) in simulated_results.iter().enumerate() {
+            let path = result.cycle.path.iter()
                 .map(|a| format_token(a, token_symbols))
                 .collect::<Vec<_>>()
                 .join(" → ");
             
-            info!(
-                "  {}. {} | DEXes: {} | Input: ${:.0} | Profit: ${:.2}",
-                i + 1,
-                style(&path).cyan(),
-                cycle.dex_path(),
-                sim.input_usd,
-                sim.profit_usd
-            );
+            let status = if result.sim.is_profitable && result.sim.profit_usd >= config.min_profit_usd {
+                if result.flash_loan_simulated && result.execution_would_succeed {
+                    style("🚀 READY").green().bold()
+                } else {
+                    style("💰 PROFITABLE").green()
+                }
+            } else if result.sim.profit_usd > -10.0 {
+                style("⚡ MARGINAL").yellow()
+            } else {
+                style("💸 LOSS").red()
+            };
             
-            // Execute based on mode
-            match config.execution_mode {
-                ExecutionMode::Simulation => {
-                    // Just log it
-                    if config.simulation_log {
-                        if let Err(e) = log_opportunity(config, cycle, sim) {
-                            warn!("Failed to log opportunity: {}", e);
-                        }
-                    }
-                }
-                ExecutionMode::DryRun | ExecutionMode::Production => {
-                    match engine.execute(cycle, sim, 0).await {
-                        Ok(result) => {
-                            info!("   Execution result: {:?}", result);
-                        }
-                        Err(e) => {
-                            warn!("   Execution failed: {}", e);
-                        }
-                    }
-                }
-            }
+            println!(
+                "│  {}. {} {} │ Net: {:>8} │ Flash: {} │",
+                i + 1,
+                status,
+                truncate_utf8(&path, 22),
+                format!("${:.2}", result.sim.profit_usd),
+                if result.flash_loan_simulated { "✓" } else { "-" }
+            );
         }
+        
+        println!("{}", style("└───────────────────────────────────────────────────────────┘").magenta());
     }
 
-    Ok((cycles_count, simulated_profitable.len()))
+    Ok((cycles_count, profitable_count, sim_count, flash_sim_count))
 }
 
-/// Log a profitable opportunity to file
+/// Log a profitable opportunity to file with full details
 fn log_opportunity(
     config: &Config,
     cycle: &ArbitrageCycle,
     sim: &simulator::swap_simulator::ArbitrageSimulation,
+    flash_loan_simulated: bool,
+    execution_would_succeed: bool,
 ) -> Result<()> {
-    use config::OpportunityLog;
-    use chrono::Utc;
+    use std::fs::OpenOptions;
+    use std::io::Write;
     
-    let log = OpportunityLog {
-        timestamp: Utc::now(),
-        path: cycle.path.iter().map(|a| format!("{:?}", a)).collect(),
-        dexes: cycle.dexes.iter().map(|d| d.to_string()).collect(),
-        input_usd: sim.input_usd,
-        gross_profit_usd: sim.profit_usd + (sim.total_gas_used as f64 * 0.5 * 1e-9 * 3500.0),
-        gas_cost_usd: sim.total_gas_used as f64 * 0.5 * 1e-9 * 3500.0,
-        net_profit_usd: sim.profit_usd,
-        gas_price_gwei: 0.5,
-        eth_price_usd: 3500.0,
-        block_number: 0,
-    };
+    // Create parent directory if needed
+    if let Some(parent) = std::path::Path::new(&config.simulation_log_path).parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     
-    log.append_to_file(&config.simulation_log_path)?;
+    let log_entry = serde_json::json!({
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "path": cycle.path.iter().map(|a| format!("{:?}", a)).collect::<Vec<_>>(),
+        "dexes": cycle.dexes.iter().map(|d| d.to_string()).collect::<Vec<_>>(),
+        "pools": cycle.pools.iter().map(|a| format!("{:?}", a)).collect::<Vec<_>>(),
+        "expected_return": cycle.expected_return,
+        "input_usd": sim.input_usd,
+        "gross_profit_usd": sim.profit_usd + (sim.total_gas_used as f64 * 0.5 * 1e-9 * 3500.0),
+        "gas_cost_usd": sim.total_gas_used as f64 * 0.5 * 1e-9 * 3500.0,
+        "net_profit_usd": sim.profit_usd,
+        "gas_used": sim.total_gas_used,
+        "liquidity_tier": format!("{:?}", sim.liquidity_tier),
+        "flash_loan_simulated": flash_loan_simulated,
+        "execution_would_succeed": execution_would_succeed,
+        "simulation_details": {
+            "input_amount": sim.input_amount.to_string(),
+            "output_amount": sim.output_amount.to_string(),
+            "return_multiplier": sim.return_multiplier(),
+        }
+    });
+    
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&config.simulation_log_path)?;
+    
+    writeln!(file, "{}", serde_json::to_string(&log_entry)?)?;
     
     Ok(())
 }
