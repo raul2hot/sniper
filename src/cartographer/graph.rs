@@ -4,7 +4,7 @@ use alloy_primitives::Address;
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef;
 use std::collections::HashMap;
-use tracing::{debug, trace, warn};  // Changed from info
+use tracing::{debug, trace, warn};
 
 use super::{Dex, PoolState, PoolType};
 
@@ -49,7 +49,6 @@ impl ArbitrageGraph {
             *dex_counts.entry(edge.weight().dex).or_insert(0) += 1;
         }
 
-        // Changed from info! to debug!
         debug!(
             "Graph: {} nodes, {} edges",
             graph.graph.node_count(),
@@ -60,7 +59,6 @@ impl ArbitrageGraph {
             trace!("Skipped {} pools with invalid prices", skipped_invalid);
         }
         
-        // DEX breakdown at trace level
         for (dex, count) in &dex_counts {
             trace!("  {}: {}", dex, count);
         }
