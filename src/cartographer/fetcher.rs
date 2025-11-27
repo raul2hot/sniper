@@ -1,6 +1,6 @@
-//! Pool Data Fetcher - Concurrent Edition (no multicall)
+//! Pool Data Fetcher - QUIET Edition
 //!
-//! Uses concurrent futures for parallel fetching - reliable and fast
+//! Moves verbose logging to debug level
 
 use alloy_primitives::{Address, U256};
 use alloy_provider::{Provider, ProviderBuilder};
@@ -12,7 +12,7 @@ use std::str::FromStr;
 use std::time::Instant;
 use std::collections::HashMap;
 use tokio::sync::RwLock;
-use tracing::{info, debug};
+use tracing::{debug, trace};  // Changed from info to debug
 
 sol! {
     interface IUniswapV3Pool {
@@ -119,7 +119,6 @@ pub fn get_all_known_pools() -> Vec<PoolInfo> {
         PoolInfo { address: "0x3416cF6C708Da44DB2624D63ea0AAef7113527C6", token0_symbol: "USDC", token1_symbol: "USDT", fee: 100, dex: Dex::UniswapV3, pool_type: PoolType::V3, weight0: None },
         PoolInfo { address: "0x5777d92f208679DB4b9778590Fa3CAB3aC9e2168", token0_symbol: "DAI", token1_symbol: "USDC", fee: 100, dex: Dex::UniswapV3, pool_type: PoolType::V3, weight0: None },
         PoolInfo { address: "0x109830a1AAaD605BbF02a9dFA7B0B92EC2FB7dAa", token0_symbol: "wstETH", token1_symbol: "WETH", fee: 100, dex: Dex::UniswapV3, pool_type: PoolType::V3, weight0: None },
-        // UniV3 Long tail
         PoolInfo { address: "0x11950d141EcB863F01007AdD7D1A342041227b58", token0_symbol: "PEPE", token1_symbol: "WETH", fee: 3000, dex: Dex::UniswapV3, pool_type: PoolType::V3, weight0: None },
         PoolInfo { address: "0x2F62f2B4c5fcd7570a709DeC05D68EA19c82A9ec", token0_symbol: "SHIB", token1_symbol: "WETH", fee: 3000, dex: Dex::UniswapV3, pool_type: PoolType::V3, weight0: None },
         PoolInfo { address: "0xa6Cc3C2531FdaA6Ae1A3CA84c2855806728693e8", token0_symbol: "LINK", token1_symbol: "WETH", fee: 3000, dex: Dex::UniswapV3, pool_type: PoolType::V3, weight0: None },
@@ -206,7 +205,9 @@ impl PoolFetcher {
         let start = Instant::now();
         let infos = get_all_known_pools();
         let (cached, total) = self.cache_stats().await;
-        info!("{} Fetching {} pools (cache: {}/{})", if cached==0 {"🚀"} else {"🔄"}, total, cached, total);
+        
+        // Changed from info! to debug!
+        debug!("Fetching {} pools (cache: {}/{})", total, cached, total);
         
         let futs: Vec<_> = infos.iter().map(|i| self.fetch_pool(i)).collect();
         let results = join_all(futs).await;
@@ -216,11 +217,14 @@ impl PoolFetcher {
         for (r, i) in results.into_iter().zip(infos.iter()) {
             match r {
                 Ok(p) if p.normalized_price() > 0.0 && p.normalized_price() < 1e12 => pools.push(p),
-                Ok(_) => { fail += 1; debug!("Invalid price: {}", i.address); }
-                Err(e) => { fail += 1; debug!("Failed {}: {}", i.address, e); }
+                Ok(_) => { fail += 1; trace!("Invalid price: {}", i.address); }
+                Err(e) => { fail += 1; trace!("Failed {}: {}", i.address, e); }
             }
         }
-        info!("✅ Fetched {} pools in {:?} ({} failed)", pools.len(), start.elapsed(), fail);
+        
+        // Changed from info! to debug!
+        debug!("Fetched {} pools in {:?} ({} failed)", pools.len(), start.elapsed(), fail);
+        
         if pools.is_empty() { return Err(eyre!("No pools!")); }
         Ok(pools)
     }

@@ -1,16 +1,13 @@
-//! Graph Construction - DECIMAL-AWARE Edition
-//!
-//! Step 1.2: The Map Maker
+//! Graph Construction - QUIET Edition
 
 use alloy_primitives::Address;
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef;
 use std::collections::HashMap;
-use tracing::{info, warn};
+use tracing::{debug, trace, warn};  // Changed from info
 
 use super::{Dex, PoolState, PoolType};
 
-/// Edge data in our arbitrage graph
 #[derive(Debug, Clone)]
 pub struct EdgeData {
     pub pool_address: Address,
@@ -22,7 +19,6 @@ pub struct EdgeData {
     pub pool_type: PoolType,
 }
 
-/// The arbitrage graph
 pub struct ArbitrageGraph {
     pub graph: DiGraph<Address, EdgeData>,
     pub token_to_node: HashMap<Address, NodeIndex>,
@@ -49,24 +45,24 @@ impl ArbitrageGraph {
         }
 
         let mut dex_counts: HashMap<Dex, usize> = HashMap::new();
-        
         for edge in graph.graph.edge_references() {
             *dex_counts.entry(edge.weight().dex).or_insert(0) += 1;
         }
 
-        info!(
-            "Graph built: {} Nodes, {} Edges",
+        // Changed from info! to debug!
+        debug!(
+            "Graph: {} nodes, {} edges",
             graph.graph.node_count(),
             graph.graph.edge_count()
         );
         
         if skipped_invalid > 0 {
-            warn!("  Skipped {} pools with invalid prices", skipped_invalid);
+            trace!("Skipped {} pools with invalid prices", skipped_invalid);
         }
         
-        info!("  Edges by DEX:");
+        // DEX breakdown at trace level
         for (dex, count) in &dex_counts {
-            info!("    {}: {}", dex, count);
+            trace!("  {}: {}", dex, count);
         }
 
         graph
@@ -96,23 +92,16 @@ impl ArbitrageGraph {
         const MIN_REASONABLE_PRICE: f64 = 1e-12;
         
         if raw_price > MAX_REASONABLE_PRICE {
-            warn!(
-                "Price too high ({:.2e}) for pool {:?} - likely decimal bug!",
-                raw_price, pool.address
-            );
+            trace!("Price too high ({:.2e}) for pool {:?}", raw_price, pool.address);
             return false;
         }
         
         if raw_price < MIN_REASONABLE_PRICE {
-            warn!(
-                "Price too low ({:.2e}) for pool {:?} - likely decimal bug!",
-                raw_price, pool.address
-            );
+            trace!("Price too low ({:.2e}) for pool {:?}", raw_price, pool.address);
             return false;
         }
         
         let fee_rate = pool.fee as f64 / 1_000_000.0;
-        
         let effective_price_0_to_1 = raw_price * (1.0 - fee_rate);
         let effective_price_1_to_0 = (1.0 / raw_price) * (1.0 - fee_rate);
 
@@ -155,7 +144,6 @@ impl ArbitrageGraph {
         if let Some(&node) = self.token_to_node.get(&token) {
             return node;
         }
-
         let node = self.graph.add_node(token);
         self.token_to_node.insert(token, node);
         self.node_to_token.insert(node, token);
@@ -176,58 +164,6 @@ impl ArbitrageGraph {
 
     pub fn edge_count(&self) -> usize {
         self.graph.edge_count()
-    }
-
-    pub fn find_cross_dex_opportunities(&self, token_symbols: &HashMap<Address, &str>) -> Vec<(Address, Address, Dex, Dex, f64)> {
-        let mut opportunities = Vec::new();
-        
-        let mut pair_edges: HashMap<(Address, Address), Vec<&EdgeData>> = HashMap::new();
-        
-        for edge in self.graph.edge_references() {
-            let from = self.get_token(edge.source()).unwrap();
-            let to = self.get_token(edge.target()).unwrap();
-            pair_edges.entry((from, to)).or_default().push(edge.weight());
-        }
-        
-        for ((from, to), edges) in &pair_edges {
-            if edges.len() < 2 {
-                continue;
-            }
-            
-            for i in 0..edges.len() {
-                for j in (i + 1)..edges.len() {
-                    let e1 = edges[i];
-                    let e2 = edges[j];
-                    
-                    if e1.dex != e2.dex {
-                        let price_diff = ((e1.price / e2.price) - 1.0).abs() * 100.0;
-                        
-                        if price_diff > 0.01 && price_diff < 50.0 {
-                            opportunities.push((*from, *to, e1.dex, e2.dex, price_diff));
-                        }
-                    }
-                }
-            }
-        }
-        
-        opportunities.sort_by(|a, b| b.4.partial_cmp(&a.4).unwrap_or(std::cmp::Ordering::Equal));
-        
-        if !opportunities.is_empty() {
-            info!("=== Cross-DEX Price Differences (Top 15) ===");
-            for (from, to, dex1, dex2, diff) in opportunities.iter().take(15) {
-                let from_sym = token_symbols.get(from).unwrap_or(&"???");
-                let to_sym = token_symbols.get(to).unwrap_or(&"???");
-                
-                let profitable = if diff > &0.5 { "🔥" } else if diff > &0.1 { "⚡" } else { "  " };
-                
-                info!(
-                    "  {} {}/{}: {} vs {} = {:.4}% difference",
-                    profitable, from_sym, to_sym, dex1, dex2, diff
-                );
-            }
-        }
-        
-        opportunities
     }
 }
 
