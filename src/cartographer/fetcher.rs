@@ -1,12 +1,11 @@
-//! Pool Data Fetcher - EXPANDED Edition (80+ Pools)
+//! Pool Data Fetcher - CACHED Edition
 //!
 //! Step 1.1: The Scout
 //!
-//! This expanded version covers:
-//! - Core pairs (WETH, USDC, USDT, DAI, WBTC) across multiple DEXes
-//! - Long-tail tokens (PEPE, SHIB, LINK, UNI, LDO, MKR, AAVE, etc.)
-//! - Multiple fee tiers for maximum arbitrage opportunity detection
-//! - Cross-DEX coverage for the same pairs
+//! OPTIMIZATIONS:
+//! - Caches static pool data (token addresses) to reduce RPC calls
+//! - Only fetches dynamic data (prices, liquidity) on subsequent scans
+//! - Reduces RPC calls by ~60% after first scan
 
 use alloy_primitives::{Address, U256};
 use alloy_provider::{Provider, ProviderBuilder};
@@ -18,6 +17,7 @@ use std::str::FromStr;
 use std::time::Instant;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 use tracing::{info, debug, warn};
 
 // ============================================
@@ -170,6 +170,21 @@ pub struct PoolInfo {
     pub weight0: Option<f64>,
 }
 
+/// Cached static pool data (doesn't change between blocks)
+#[derive(Debug, Clone)]
+struct CachedPoolData {
+    token0: Address,
+    token1: Address,
+    token0_decimals: u8,
+    token1_decimals: u8,
+    fee: u32,
+}
+
+/// Global cache for static pool data
+lazy_static::lazy_static! {
+    static ref POOL_CACHE: RwLock<HashMap<Address, CachedPoolData>> = RwLock::new(HashMap::new());
+}
+
 /// Get token decimals from address - EXPORTED for use by simulator
 pub fn get_token_decimals(address: &Address) -> u8 {
     let addr_lower = format!("{:?}", address).to_lowercase();
@@ -216,7 +231,7 @@ pub fn get_token_decimals(address: &Address) -> u8 {
 }
 
 // ============================================
-// EXPANDED POOL DEFINITIONS
+// POOL DEFINITIONS
 // ============================================
 
 /// Uniswap V3 - Core pairs (multiple fee tiers)
@@ -445,7 +460,7 @@ pub fn get_all_known_pools() -> Vec<PoolInfo> {
     pools
 }
 
-/// Pool data fetcher using manual eth_call
+/// Pool data fetcher using manual eth_call with CACHING
 pub struct PoolFetcher {
     rpc_url: String,
 }
@@ -473,7 +488,63 @@ impl PoolFetcher {
         Ok(result.to_vec())
     }
 
+    /// Check if we have cached data for a pool
+    async fn get_cached_data(&self, pool_address: &Address) -> Option<CachedPoolData> {
+        let cache = POOL_CACHE.read().await;
+        cache.get(pool_address).cloned()
+    }
+
+    /// Store pool data in cache
+    async fn cache_pool_data(&self, pool_address: Address, data: CachedPoolData) {
+        let mut cache = POOL_CACHE.write().await;
+        cache.insert(pool_address, data);
+    }
+
+    /// Fetch V3 pool - uses cache for static data
     async fn fetch_v3_pool_inner(&self, pool_address: Address, dex: Dex) -> Result<PoolState> {
+        // Check cache first for static data
+        let cached = self.get_cached_data(&pool_address).await;
+        
+        let (token0, token1, token0_decimals, token1_decimals, fee) = if let Some(cache) = cached {
+            // Use cached static data - saves 3 RPC calls!
+            debug!("Using cached data for pool {:?}", pool_address);
+            (cache.token0, cache.token1, cache.token0_decimals, cache.token1_decimals, cache.fee)
+        } else {
+            // First time - fetch and cache static data
+            debug!("Fetching and caching static data for pool {:?}", pool_address);
+            
+            let t0_calldata = IUniswapV3Pool::token0Call {}.abi_encode();
+            let t0_result = self.call_contract(pool_address, t0_calldata).await?;
+            let token0 = IUniswapV3Pool::token0Call::abi_decode_returns(&t0_result)
+                .map_err(|e| eyre!("token0 decode: {}", e))?;
+            
+            let t1_calldata = IUniswapV3Pool::token1Call {}.abi_encode();
+            let t1_result = self.call_contract(pool_address, t1_calldata).await?;
+            let token1 = IUniswapV3Pool::token1Call::abi_decode_returns(&t1_result)
+                .map_err(|e| eyre!("token1 decode: {}", e))?;
+            
+            let fee_calldata = IUniswapV3Pool::feeCall {}.abi_encode();
+            let fee_result = self.call_contract(pool_address, fee_calldata).await?;
+            let fee = IUniswapV3Pool::feeCall::abi_decode_returns(&fee_result)
+                .map_err(|e| eyre!("fee decode: {}", e))?;
+
+            let token0_decimals = self.get_decimals(token0);
+            let token1_decimals = self.get_decimals(token1);
+            let fee_u32: u32 = fee.to();
+            
+            // Cache the static data
+            self.cache_pool_data(pool_address, CachedPoolData {
+                token0,
+                token1,
+                token0_decimals,
+                token1_decimals,
+                fee: fee_u32,
+            }).await;
+            
+            (token0, token1, token0_decimals, token1_decimals, fee_u32)
+        };
+        
+        // Always fetch dynamic data (changes every block)
         let slot0_calldata = IUniswapV3Pool::slot0Call {}.abi_encode();
         let slot0_result = self.call_contract(pool_address, slot0_calldata).await?;
         let slot0 = IUniswapV3Pool::slot0Call::abi_decode_returns(&slot0_result)
@@ -483,27 +554,8 @@ impl PoolFetcher {
         let liq_result = self.call_contract(pool_address, liq_calldata).await?;
         let liquidity = IUniswapV3Pool::liquidityCall::abi_decode_returns(&liq_result)
             .map_err(|e| eyre!("liquidity decode: {}", e))?;
-        
-        let t0_calldata = IUniswapV3Pool::token0Call {}.abi_encode();
-        let t0_result = self.call_contract(pool_address, t0_calldata).await?;
-        let token0 = IUniswapV3Pool::token0Call::abi_decode_returns(&t0_result)
-            .map_err(|e| eyre!("token0 decode: {}", e))?;
-        
-        let t1_calldata = IUniswapV3Pool::token1Call {}.abi_encode();
-        let t1_result = self.call_contract(pool_address, t1_calldata).await?;
-        let token1 = IUniswapV3Pool::token1Call::abi_decode_returns(&t1_result)
-            .map_err(|e| eyre!("token1 decode: {}", e))?;
-        
-        let fee_calldata = IUniswapV3Pool::feeCall {}.abi_encode();
-        let fee_result = self.call_contract(pool_address, fee_calldata).await?;
-        let fee = IUniswapV3Pool::feeCall::abi_decode_returns(&fee_result)
-            .map_err(|e| eyre!("fee decode: {}", e))?;
-
-        let token0_decimals = self.get_decimals(token0);
-        let token1_decimals = self.get_decimals(token1);
 
         let sqrt_price: u128 = slot0.sqrtPriceX96.to();
-        let fee_u32: u32 = fee.to();
 
         Ok(PoolState {
             address: pool_address,
@@ -515,7 +567,7 @@ impl PoolFetcher {
             tick: slot0.tick.as_i32(),
             liquidity,
             reserve1: 0,
-            fee: fee_u32,
+            fee,
             is_v4: false,
             dex,
             pool_type: PoolType::V3,
@@ -523,24 +575,49 @@ impl PoolFetcher {
         })
     }
 
+    /// Fetch V2 pool - uses cache for static data
     async fn fetch_v2_pool_inner(&self, pool_address: Address, dex: Dex, fee: u32) -> Result<PoolState> {
+        // Check cache first for static data
+        let cached = self.get_cached_data(&pool_address).await;
+        
+        let (token0, token1, token0_decimals, token1_decimals) = if let Some(cache) = cached {
+            // Use cached static data - saves 2 RPC calls!
+            debug!("Using cached data for V2 pool {:?}", pool_address);
+            (cache.token0, cache.token1, cache.token0_decimals, cache.token1_decimals)
+        } else {
+            // First time - fetch and cache static data
+            debug!("Fetching and caching static data for V2 pool {:?}", pool_address);
+            
+            let t0_calldata = IUniswapV2Pair::token0Call {}.abi_encode();
+            let t0_result = self.call_contract(pool_address, t0_calldata).await?;
+            let token0 = IUniswapV2Pair::token0Call::abi_decode_returns(&t0_result)
+                .map_err(|e| eyre!("token0 decode: {}", e))?;
+            
+            let t1_calldata = IUniswapV2Pair::token1Call {}.abi_encode();
+            let t1_result = self.call_contract(pool_address, t1_calldata).await?;
+            let token1 = IUniswapV2Pair::token1Call::abi_decode_returns(&t1_result)
+                .map_err(|e| eyre!("token1 decode: {}", e))?;
+
+            let token0_decimals = self.get_decimals(token0);
+            let token1_decimals = self.get_decimals(token1);
+            
+            // Cache the static data
+            self.cache_pool_data(pool_address, CachedPoolData {
+                token0,
+                token1,
+                token0_decimals,
+                token1_decimals,
+                fee,
+            }).await;
+            
+            (token0, token1, token0_decimals, token1_decimals)
+        };
+        
+        // Always fetch reserves (dynamic data)
         let res_calldata = IUniswapV2Pair::getReservesCall {}.abi_encode();
         let res_result = self.call_contract(pool_address, res_calldata).await?;
         let reserves = IUniswapV2Pair::getReservesCall::abi_decode_returns(&res_result)
             .map_err(|e| eyre!("reserves decode: {}", e))?;
-        
-        let t0_calldata = IUniswapV2Pair::token0Call {}.abi_encode();
-        let t0_result = self.call_contract(pool_address, t0_calldata).await?;
-        let token0 = IUniswapV2Pair::token0Call::abi_decode_returns(&t0_result)
-            .map_err(|e| eyre!("token0 decode: {}", e))?;
-        
-        let t1_calldata = IUniswapV2Pair::token1Call {}.abi_encode();
-        let t1_result = self.call_contract(pool_address, t1_calldata).await?;
-        let token1 = IUniswapV2Pair::token1Call::abi_decode_returns(&t1_result)
-            .map_err(|e| eyre!("token1 decode: {}", e))?;
-
-        let token0_decimals = self.get_decimals(token0);
-        let token1_decimals = self.get_decimals(token1);
 
         let reserve0: u128 = reserves.reserve0.to();
         let reserve1: u128 = reserves.reserve1.to();
@@ -582,14 +659,27 @@ impl PoolFetcher {
         }
     }
 
+    /// Get cache statistics
+    pub async fn cache_stats(&self) -> (usize, usize) {
+        let cache = POOL_CACHE.read().await;
+        let all_pools = get_all_known_pools();
+        (cache.len(), all_pools.len())
+    }
+
     pub async fn fetch_all_pools(&self) -> Result<Vec<PoolState>> {
         let start = Instant::now();
-        info!("🚀 Fetching pools from 5 DEXes (EXPANDED - 80+ pools)...");
+        
+        let (cached, total) = self.cache_stats().await;
+        let is_first_run = cached == 0;
+        
+        if is_first_run {
+            info!("🚀 First scan - fetching all pool data (will cache static data)...");
+        } else {
+            info!("🔄 Subsequent scan - using cached static data ({}/{} pools cached)", cached, total);
+        }
         
         let all_pool_infos = get_all_known_pools();
         let total_pools = all_pool_infos.len();
-        
-        info!("   Queuing {} pool fetch requests...", total_pools);
 
         let futures: Vec<_> = all_pool_infos
             .iter()
@@ -615,8 +705,8 @@ impl PoolFetcher {
                         pools.push(pool);
                         success_count += 1;
                     } else {
-                        warn!(
-                            "⚠ [{}] {}/{}: INVALID price={:.2e} - skipping",
+                        debug!(
+                            "⚠ [{}] {}/{}: INVALID price={:.2e}",
                             info.dex, info.token0_symbol, info.token1_symbol, price
                         );
                         fail_count += 1;
@@ -644,14 +734,28 @@ impl PoolFetcher {
             .filter(|p| p.pool_type == PoolType::V3 && p.fee <= 500)
             .count();
 
-        info!("✅ Fetched {} pools in {:?} ({} failed/invalid)", success_count, elapsed, fail_count);
-        info!("   By DEX:");
+        info!(
+            "✅ Fetched {} pools in {:?} ({} failed/invalid)",
+            success_count, elapsed, fail_count
+        );
+        
+        // Log RPC savings on subsequent runs
+        if !is_first_run {
+            // On first run: ~5 calls per V3 pool, ~3 calls per V2 pool
+            // On subsequent runs: ~2 calls per V3 pool, ~1 call per V2 pool
+            let v3_count = pools.iter().filter(|p| p.pool_type == PoolType::V3).count();
+            let v2_count = pools.iter().filter(|p| matches!(p.pool_type, PoolType::V2 | PoolType::Balancer)).count();
+            let calls_saved = (v3_count * 3) + (v2_count * 2);
+            info!("   💰 Saved ~{} RPC calls using cache!", calls_saved);
+        }
+        
+        debug!("   By DEX:");
         for dex in [Dex::UniswapV3, Dex::UniswapV2, Dex::SushiswapV2, Dex::PancakeSwapV3, Dex::BalancerV2] {
             if let Some(&count) = counts.get(&dex) {
-                info!("     {}: {} pools", dex, count);
+                debug!("     {}: {} pools", dex, count);
             }
         }
-        info!("   Low-fee pools (≤5bps): {}", low_fee_count);
+        debug!("   Low-fee pools (≤5bps): {}", low_fee_count);
 
         if pools.is_empty() {
             return Err(eyre!("No pools fetched! Check your RPC URL."));

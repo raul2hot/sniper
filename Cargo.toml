@@ -1,6 +1,6 @@
 [package]
 name = "sniper"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 authors = ["Your Name <your@email.com>"]
 description = "Arbitrage detection bot for Uniswap V3/V4 + Multiple DEXes"
@@ -80,6 +80,9 @@ indicatif = "0.17"  # Progress bars
 
 # Hex encoding
 hex = "0.4"
+
+# Lazy static for global caching (NEW - for RPC optimization)
+lazy_static = "1.4"
 
 [dev-dependencies]
 # Testing utilities

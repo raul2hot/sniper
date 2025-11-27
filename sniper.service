@@ -1,0 +1,46 @@
+# /etc/systemd/system/sniper.service
+#
+# IMPORTANT: This service file is for the CONTINUOUS LOOP version.
+# The bot runs indefinitely scanning every ~12 seconds.
+# Only restart on failure, not on success.
+
+[Unit]
+Description=The Sniper Arbitrage Bot (Continuous)
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=your-username
+Group=your-username
+
+# Working directory
+WorkingDirectory=/home/your-username/sniper
+
+# The bot runs continuously - don't restart on normal exit
+ExecStart=/home/your-username/sniper/target/release/sniper
+
+# Only restart on failure, not on normal exit
+Restart=on-failure
+RestartSec=30
+
+# Kill after 90s if unresponsive
+TimeoutStopSec=90
+
+# Environment
+Environment="RUST_LOG=sniper=info"
+Environment="RUST_BACKTRACE=1"
+
+# Memory limit (optional - prevent runaway memory)
+MemoryMax=1G
+
+# CPU limit (optional - prevent runaway CPU)
+CPUQuota=80%
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sniper
+
+[Install]
+WantedBy=multi-user.target

@@ -1,11 +1,11 @@
-//! The Sniper - Arbitrage Detection Bot (Phase 4: FIXED Edition)
+//! The Sniper - Arbitrage Detection Bot (Phase 4: CONTINUOUS LOOP Edition)
 //!
 //! Run with: cargo run
 //!
-//! FIXES:
-//! - Dynamic simulation sizing based on token liquidity
-//! - Proper gas price handling
-//! - Multiple size attempts to find profitable amount
+//! CHANGES:
+//! - Continuous loop instead of one-shot execution
+//! - Proper error handling with retry logic
+//! - Reduced RPC costs by not restarting
 
 use alloy_primitives::Address;
 use color_eyre::eyre::Result;
@@ -36,11 +36,11 @@ fn print_banner() {
     );
     println!(
         "{}",
-        style(" 🎯 THE SNIPER - Arbitrage Detection Bot (FIXED Edition)").cyan().bold()
+        style(" 🎯 THE SNIPER - Arbitrage Detection Bot (CONTINUOUS Edition)").cyan().bold()
     );
     println!(
         "{}",
-        style("    5 DEXes | Dynamic Sizing | Proper Gas Handling").cyan()
+        style("    5 DEXes | Dynamic Sizing | Continuous Scanning").cyan()
     );
     println!(
         "{}",
@@ -161,6 +161,45 @@ async fn simulate_with_optimal_size(
     best_sim
 }
 
+/// Statistics tracking across scans
+struct ScanStats {
+    total_scans: u64,
+    profitable_found: u64,
+    total_cycles_analyzed: u64,
+    last_profitable_scan: Option<u64>,
+}
+
+impl ScanStats {
+    fn new() -> Self {
+        Self {
+            total_scans: 0,
+            profitable_found: 0,
+            total_cycles_analyzed: 0,
+            last_profitable_scan: None,
+        }
+    }
+    
+    fn record_scan(&mut self, cycles: usize, profitable: usize) {
+        self.total_scans += 1;
+        self.total_cycles_analyzed += cycles as u64;
+        self.profitable_found += profitable as u64;
+        if profitable > 0 {
+            self.last_profitable_scan = Some(self.total_scans);
+        }
+    }
+    
+    fn print_summary(&self) {
+        info!("━━━━━━━━━━━━ CUMULATIVE STATS ━━━━━━━━━━━━");
+        info!("Total scans: {}", self.total_scans);
+        info!("Cycles analyzed: {}", self.total_cycles_analyzed);
+        info!("Profitable opportunities: {}", self.profitable_found);
+        if let Some(last) = self.last_profitable_scan {
+            info!("Last profitable: scan #{}", last);
+        }
+        info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
@@ -185,96 +224,135 @@ async fn main() -> Result<()> {
         return Err(e.into());
     }
     
-    // Print configuration summary
+    // Print configuration summary (only once at startup)
     config.print_summary();
     println!();
 
     let token_symbols = build_token_symbols();
+    
+    // Initialize execution engine once
+    let engine = ExecutionEngine::new(config.clone());
+    
+    // Initialize stats tracking
+    let mut stats = ScanStats::new();
+    
+    // Track consecutive failures for backoff
+    let mut consecutive_failures = 0u32;
+    
+    info!("🚀 Starting continuous scanning loop...");
+    info!("   Scan interval: {} seconds", config.scan_interval_secs);
+    info!("   Press Ctrl+C to stop");
+    println!();
 
+    // ========================================
+    // MAIN CONTINUOUS LOOP
+    // ========================================
+    loop {
+        let scan_number = stats.total_scans + 1;
+        
+        // Check emergency stop (re-read from env for hot reload)
+        if std::env::var("EMERGENCY_STOP").unwrap_or_default() == "true" || config.emergency_stop {
+            warn!("🛑 Emergency stop is active. Waiting 60 seconds...");
+            tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+            continue;
+        }
+        
+        info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        info!("🔄 SCAN #{} starting at {}", scan_number, chrono::Utc::now().format("%H:%M:%S UTC"));
+        info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        
+        let scan_start = Instant::now();
+        
+        // Run the scan
+        match run_single_scan(&config, &token_symbols, &engine).await {
+            Ok((cycles_count, profitable_count)) => {
+                consecutive_failures = 0;
+                stats.record_scan(cycles_count, profitable_count);
+                
+                let scan_duration = scan_start.elapsed();
+                
+                if profitable_count > 0 {
+                    info!(
+                        "{}",
+                        style(format!(
+                            "💰 SCAN #{} COMPLETE: {} profitable opportunities found! (took {:?})",
+                            scan_number, profitable_count, scan_duration
+                        )).green().bold()
+                    );
+                } else {
+                    info!(
+                        "✅ Scan #{} complete: {} cycles analyzed, 0 profitable (took {:?})",
+                        scan_number, cycles_count, scan_duration
+                    );
+                }
+            }
+            Err(e) => {
+                consecutive_failures += 1;
+                error!("❌ Scan #{} failed: {}", scan_number, e);
+                
+                // Record failed scan in stats
+                stats.record_scan(0, 0);
+                
+                if consecutive_failures >= config.max_consecutive_failures {
+                    warn!(
+                        "⚠️ {} consecutive failures. Backing off for {} seconds...",
+                        consecutive_failures, config.failure_pause_secs
+                    );
+                    tokio::time::sleep(tokio::time::Duration::from_secs(config.failure_pause_secs)).await;
+                    consecutive_failures = 0;
+                }
+            }
+        }
+        
+        // Print cumulative stats every 10 scans
+        if stats.total_scans % 10 == 0 {
+            stats.print_summary();
+        }
+        
+        // Wait for next scan
+        debug!(
+            "💤 Sleeping {} seconds until next scan...",
+            config.scan_interval_secs
+        );
+        tokio::time::sleep(tokio::time::Duration::from_secs(config.scan_interval_secs)).await;
+    }
+}
+
+/// Run a single scan iteration
+/// Returns (cycles_analyzed, profitable_count)
+async fn run_single_scan(
+    config: &Config,
+    token_symbols: &HashMap<Address, &'static str>,
+    engine: &ExecutionEngine,
+) -> Result<(usize, usize)> {
+    
     // =============================================
     // PHASE 1: THE CARTOGRAPHER
     // =============================================
-    println!();
-    println!(
-        "{}",
-        style("═══ PHASE 1: THE CARTOGRAPHER ═══").blue().bold()
-    );
-    println!();
-
-    println!("{}", style("Step 1.1: Fetching pool data from 5 DEXes...").blue());
-    let start = Instant::now();
+    debug!("Phase 1: Fetching pool data...");
+    let fetch_start = Instant::now();
 
     let fetcher = PoolFetcher::new(config.rpc_url.clone());
     let pools = fetcher.fetch_all_pools().await?;
 
-    let fetch_time = start.elapsed();
-    
-    let mut dex_counts: HashMap<Dex, usize> = HashMap::new();
-    for pool in &pools {
-        *dex_counts.entry(pool.dex).or_insert(0) += 1;
-    }
-    
-    let low_fee_count = pools.iter()
-        .filter(|p| p.pool_type == PoolType::V3 && p.fee <= 500)
-        .count();
-    
-    println!(
-        "{} Fetched {} pools in {:?}",
-        style("✓").green(),
-        pools.len(),
-        fetch_time
-    );
-    
-    println!("   DEX breakdown:");
-    for (dex, count) in &dex_counts {
-        println!("     {}: {} pools", dex, count);
-    }
-    println!("   Low-fee pools (≤5bps): {}", low_fee_count);
+    let fetch_time = fetch_start.elapsed();
+    debug!("Fetched {} pools in {:?}", pools.len(), fetch_time);
 
     let eth_price = get_eth_price_from_pools(&pools);
-    println!("{} ETH price: ${:.2}", style("✓").green(), eth_price);
+    debug!("ETH price: ${:.2}", eth_price);
 
-    // Step 1.2: Build the graph
-    println!();
-    println!("{}", style("Step 1.2: Building cross-DEX arbitrage graph...").blue());
-    let start = Instant::now();
-
+    // Build the graph
     let graph = ArbitrageGraph::from_pools(&pools);
-
-    let build_time = start.elapsed();
-    println!(
-        "{} Graph built in {:?}: {} nodes, {} edges",
-        style("✓").green(),
-        build_time,
+    debug!(
+        "Graph: {} nodes, {} edges",
         graph.node_count(),
         graph.edge_count()
-    );
-
-    // Find cross-DEX price differences
-    println!();
-    println!("{}", style("Step 1.3: Scanning for cross-DEX price differences...").blue());
-    let opportunities = graph.find_cross_dex_opportunities(&token_symbols);
-    println!(
-        "{} Found {} token pairs with cross-DEX price differences",
-        style("✓").green(),
-        opportunities.len()
     );
 
     // =============================================
     // PHASE 2: THE BRAIN
     // =============================================
-    println!();
-    println!(
-        "{}",
-        style("═══ PHASE 2: THE BRAIN ═══").magenta().bold()
-    );
-    println!();
-
-    println!(
-        "{}",
-        style("Step 2.1: Running Bellman-Ford algorithm...").magenta()
-    );
-    let start = Instant::now();
+    debug!("Phase 2: Running Bellman-Ford...");
 
     let bellman_ford = BoundedBellmanFord::new(&graph, config.max_hops);
     let base_tokens = config.base_token_addresses();
@@ -286,156 +364,46 @@ async fn main() -> Result<()> {
         .filter(|c| !config.is_cycle_blacklisted(&c.path))
         .collect();
 
-    let algo_time = start.elapsed();
-    
-    let cross_dex_count = cycles.iter().filter(|c| c.is_cross_dex()).count();
-    let low_fee_cycle_count = cycles.iter().filter(|c| c.has_low_fee_pools()).count();
-    
-    println!(
-        "{} Found {} cycles in {:?} (after filtering blacklisted pairs)",
-        style("✓").green(),
-        cycles.len(),
-        algo_time,
-    );
-    println!("   {} cross-DEX cycles", cross_dex_count);
-    println!("   {} using low-fee pools", low_fee_cycle_count);
+    let cycles_count = cycles.len();
+    debug!("Found {} valid cycles", cycles_count);
 
-    // Step 2.2: Filter for profitable cycles (graph-based estimate)
-    println!();
-    println!(
-        "{}",
-        style("Step 2.2: Analyzing profitability (graph estimates)...").magenta()
-    );
-
+    // Quick profit filter
     let mut filter = ProfitFilter::new(config.min_profit_usd);
     filter.set_eth_price(eth_price);
-    filter.set_gas_price(0.5); // Nov 2025: gas is ~0.05-0.5 gwei due to L2 adoption
+    filter.set_gas_price(0.5);
 
-    filter.print_summary(&cycles, &token_symbols);
-
-    let profitable_candidates = filter.filter_profitable(&cycles, &token_symbols);
+    let profitable_candidates = filter.filter_profitable(&cycles, token_symbols);
 
     // =============================================
     // PHASE 3: THE SIMULATOR
     // =============================================
-    println!();
-    println!(
-        "{}",
-        style("═══ PHASE 3: THE SIMULATOR ═══").green().bold()
-    );
-    println!();
-
     let mut simulated_profitable = Vec::new();
 
-    if cycles.is_empty() {
-        println!("{}", style("No cycles to simulate.").yellow());
-    } else {
-        println!(
-            "{}",
-            style("Step 3.1: Initializing simulator with dynamic sizing...").green()
-        );
+    if !profitable_candidates.is_empty() {
+        debug!("Phase 3: Simulating {} candidates...", profitable_candidates.len());
         
         match SwapSimulator::new(&config.rpc_url).await {
             Ok(mut swap_sim) => {
                 swap_sim.set_eth_price(eth_price);
-                // Don't override gas price - let it use the fetched/minimum value
                 
-                let actual_gas = swap_sim.gas_price_gwei();
-                println!(
-                    "{} Simulator initialized (gas: {:.2} gwei, ETH: ${:.0})",
-                    style("✓").green(),
-                    actual_gas,
-                    eth_price
-                );
+                // Take top 10 candidates for simulation
+                let cycles_to_simulate: Vec<_> = profitable_candidates
+                    .iter()
+                    .take(10)
+                    .map(|p| &p.cycle)
+                    .cloned()
+                    .collect();
                 
-                // Take top candidates based on graph analysis
-                let cycles_to_simulate: Vec<_> = if !profitable_candidates.is_empty() {
-                    profitable_candidates.iter()
-                        .take(15)  // Simulate more candidates
-                        .map(|p| &p.cycle)
-                        .cloned()
-                        .collect()
-                } else {
-                    cycles.iter().take(10).cloned().collect()
-                };
-                
-                if !cycles_to_simulate.is_empty() {
-                    println!();
-                    println!(
-                        "{}",
-                        style(format!(
-                            "Step 3.2: Simulating {} cycles with dynamic sizing...",
-                            cycles_to_simulate.len()
-                        )).green()
-                    );
-                    println!();
-                    
-                    for (i, cycle) in cycles_to_simulate.iter().enumerate() {
-                        let path = cycle.path.iter()
-                            .map(|a| format_token(a, &token_symbols))
-                            .collect::<Vec<_>>()
-                            .join(" → ");
-                        
-                        // Get the liquidity tier
-                        let tier = swap_sim.get_cycle_liquidity_tier(cycle);
-                        
-                        // Try to find profitable size
-                        if let Some(sim) = simulate_with_optimal_size(&swap_sim, cycle, &token_symbols).await {
-                            let status = if sim.is_profitable {
-                                style("💰 PROFITABLE").green().bold()
-                            } else {
-                                style("○ unprofitable").yellow()
-                            };
-                            
-                            println!(
-                                "  {}. {} | {} | ${:.0} input ({:?}) | Net: ${:.2}",
-                                i + 1,
-                                status,
-                                style(&path).cyan(),
-                                sim.input_usd,
-                                tier,
-                                sim.profit_usd
-                            );
-                            
-                            if sim.is_profitable && sim.profit_usd >= config.min_profit_usd {
-                                simulated_profitable.push((cycle.clone(), sim));
-                            }
-                        } else {
-                            println!(
-                                "  {}. {} | {} | Simulation failed",
-                                i + 1,
-                                style("✗ FAILED").red(),
-                                style(&path).cyan()
-                            );
+                for cycle in &cycles_to_simulate {
+                    if let Some(sim) = simulate_with_optimal_size(&swap_sim, cycle, token_symbols).await {
+                        if sim.is_profitable && sim.profit_usd >= config.min_profit_usd {
+                            simulated_profitable.push((cycle.clone(), sim));
                         }
-                    }
-                    
-                    println!();
-                    println!(
-                        "{} Simulation complete: {} profitable cycles found",
-                        style("✓").green(),
-                        simulated_profitable.len()
-                    );
-                    
-                    if simulated_profitable.is_empty() && !profitable_candidates.is_empty() {
-                        println!();
-                        println!("{}", style("📊 Analysis: Graph showed profit, simulation showed loss").yellow());
-                        println!("   This is due to SLIPPAGE - the actual price impact when trading.");
-                        println!("   The market is efficient; others have already captured the opportunity.");
-                        println!();
-                        println!("   The bot is working correctly! Opportunities appear during:");
-                        println!("   • High volatility (ETH pumps/dumps 5%+)");
-                        println!("   • Large whale trades");
-                        println!("   • New pool launches");
                     }
                 }
             }
             Err(e) => {
-                println!(
-                    "{} Failed to initialize simulator: {}",
-                    style("✗").red(),
-                    e
-                );
+                warn!("Simulator init failed: {}", e);
             }
         }
     }
@@ -443,135 +411,79 @@ async fn main() -> Result<()> {
     // =============================================
     // PHASE 4: THE EXECUTOR
     // =============================================
-    println!();
-    println!(
-        "{}",
-        style("═══ PHASE 4: THE EXECUTOR ═══").yellow().bold()
-    );
-    println!();
-
-    let engine = ExecutionEngine::new(config.clone());
-    
-    match config.execution_mode {
-        ExecutionMode::Simulation => {
-            println!(
-                "{} Mode: {} - Finding opportunities only",
-                style("📋").cyan(),
-                style("SIMULATION").cyan().bold()
+    if !simulated_profitable.is_empty() {
+        info!(
+            "{}",
+            style(format!("🎯 {} PROFITABLE OPPORTUNITIES FOUND!", simulated_profitable.len()))
+                .green()
+                .bold()
+        );
+        
+        for (i, (cycle, sim)) in simulated_profitable.iter().enumerate() {
+            let path = cycle.path.iter()
+                .map(|a| format_token(a, token_symbols))
+                .collect::<Vec<_>>()
+                .join(" → ");
+            
+            info!(
+                "  {}. {} | DEXes: {} | Input: ${:.0} | Profit: ${:.2}",
+                i + 1,
+                style(&path).cyan(),
+                cycle.dex_path(),
+                sim.input_usd,
+                sim.profit_usd
             );
             
-            if simulated_profitable.is_empty() {
-                println!();
-                println!(
-                    "{}",
-                    style("No profitable opportunities confirmed by simulation.").yellow()
-                );
-                println!("This is normal in calm markets. The bot is working correctly!");
-            } else {
-                println!();
-                println!(
-                    "{}",
-                    style(format!("Found {} PROFITABLE opportunities!", simulated_profitable.len())).green().bold()
-                );
-                
-                for (i, (cycle, sim)) in simulated_profitable.iter().enumerate() {
-                    let path = cycle.path.iter()
-                        .map(|a| format_token(a, &token_symbols))
-                        .collect::<Vec<_>>()
-                        .join(" → ");
-                    
-                    println!();
-                    println!("{}. {}", i + 1, style(&path).cyan());
-                    println!("   DEXes: {}", cycle.dex_path());
-                    println!("   Input: ${:.0} ({:?} tier)", sim.input_usd, sim.liquidity_tier);
-                    println!("   Expected profit: ${:.2}", sim.profit_usd);
-                    println!("   Gas estimate: {} units", sim.total_gas_used);
-                    
-                    // Execute (in simulation mode, this just logs)
-                    match engine.execute(cycle, sim, 0).await {
-                        Ok(result) => {
-                            if result.is_success() {
-                                println!("   Status: {} Would execute!", style("✓").green());
-                            }
-                        }
-                        Err(e) => {
-                            warn!("Execution error: {}", e);
+            // Execute based on mode
+            match config.execution_mode {
+                ExecutionMode::Simulation => {
+                    // Just log it
+                    if config.simulation_log {
+                        if let Err(e) = log_opportunity(config, cycle, sim) {
+                            warn!("Failed to log opportunity: {}", e);
                         }
                     }
                 }
-                
-                if config.simulation_log {
-                    println!();
-                    println!(
-                        "{} Opportunities logged to: {}",
-                        style("📝").cyan(),
-                        config.simulation_log_path
-                    );
+                ExecutionMode::DryRun | ExecutionMode::Production => {
+                    match engine.execute(cycle, sim, 0).await {
+                        Ok(result) => {
+                            info!("   Execution result: {:?}", result);
+                        }
+                        Err(e) => {
+                            warn!("   Execution failed: {}", e);
+                        }
+                    }
                 }
             }
         }
-        
-        ExecutionMode::DryRun => {
-            println!(
-                "{} Mode: {} - Building bundles, not submitting",
-                style("🔬").yellow(),
-                style("DRY RUN").yellow().bold()
-            );
-            
-            if simulated_profitable.is_empty() {
-                println!("No profitable opportunities to test.");
-            } else {
-                println!("Testing {} opportunities with Flashbots...", simulated_profitable.len());
-            }
-        }
-        
-        ExecutionMode::Production => {
-            if !engine.is_production_ready() {
-                error!("Production mode enabled but requirements not met!");
-                error!("Please configure:");
-                error!("  - FLASHBOTS_SIGNER_KEY");
-                error!("  - PROFIT_WALLET_ADDRESS");
-                error!("  - EXECUTOR_CONTRACT_ADDRESS");
-            } else {
-                println!(
-                    "{} Mode: {} - LIVE EXECUTION",
-                    style("🚀").red(),
-                    style("PRODUCTION").red().bold()
-                );
-                warn!("⚠️  This mode uses real funds!");
-            }
-        }
     }
 
-    // =============================================
-    // SUMMARY
-    // =============================================
-    println!();
-    println!(
-        "{}",
-        style("═══════════════════════════════════════════════════════════════").green()
-    );
-    println!(
-        "{}",
-        style(" ✅ SCAN COMPLETE").green().bold()
-    );
-    println!(
-        "{}",
-        style("═══════════════════════════════════════════════════════════════").green()
-    );
-    println!();
-    println!("Summary:");
-    println!("  • Pools scanned: {} across {} DEXes", pools.len(), dex_counts.len());
-    println!("  • Cycles analyzed: {} ({} cross-DEX)", cycles.len(), cross_dex_count);
-    println!("  • Graph-profitable: {} (before simulation)", profitable_candidates.len());
-    println!("  • Simulation-profitable: {}", simulated_profitable.len());
-    println!("  • Execution mode: {}", config.execution_mode);
-    println!();
+    Ok((cycles_count, simulated_profitable.len()))
+}
+
+/// Log a profitable opportunity to file
+fn log_opportunity(
+    config: &Config,
+    cycle: &ArbitrageCycle,
+    sim: &simulator::swap_simulator::ArbitrageSimulation,
+) -> Result<()> {
+    use config::OpportunityLog;
+    use chrono::Utc;
     
-    if simulated_profitable.is_empty() {
-        println!("{}", style("💡 The bot found price differences but slippage makes them unprofitable.").cyan());
-        println!("{}", style("   This is normal - run continuously for opportunities during volatility!").cyan());
-    }
-
+    let log = OpportunityLog {
+        timestamp: Utc::now(),
+        path: cycle.path.iter().map(|a| format!("{:?}", a)).collect(),
+        dexes: cycle.dexes.iter().map(|d| d.to_string()).collect(),
+        input_usd: sim.input_usd,
+        gross_profit_usd: sim.profit_usd + (sim.total_gas_used as f64 * 0.5 * 1e-9 * 3500.0),
+        gas_cost_usd: sim.total_gas_used as f64 * 0.5 * 1e-9 * 3500.0,
+        net_profit_usd: sim.profit_usd,
+        gas_price_gwei: 0.5,
+        eth_price_usd: 3500.0,
+        block_number: 0,
+    };
+    
+    log.append_to_file(&config.simulation_log_path)?;
+    
     Ok(())
 }
