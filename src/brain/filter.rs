@@ -1,6 +1,9 @@
-//! Profit Filter - SANITY-CHECKED Edition
+//! Profit Filter - FIXED Edition
 //!
-//! Step 2.2: The Filter
+//! FIXES:
+//! 1. Better suspicious cycle detection
+//! 2. More granular profit thresholds
+//! 3. Gas cost estimation per DEX type
 
 use alloy_primitives::Address;
 use console::style;
@@ -20,6 +23,7 @@ pub struct ProfitAnalysis {
     pub net_profit_usd: f64,
     pub is_profitable: bool,
     pub is_suspicious: bool,
+    pub suspicion_reason: Option<String>,
 }
 
 impl ProfitAnalysis {
@@ -48,6 +52,10 @@ pub struct ProfitFilter {
     gas_price_gwei: f64,
     eth_price_usd: f64,
     default_input_usd: f64,
+    
+    // Suspicious thresholds
+    max_reasonable_return: f64,
+    max_profit_usd: f64,
 }
 
 impl ProfitFilter {
@@ -58,9 +66,13 @@ impl ProfitFilter {
             gas_per_swap_v2: 100_000,
             gas_per_swap_balancer: 120_000,
             gas_per_swap_curve: 200_000,
-            gas_price_gwei: 20.0,
-            eth_price_usd: 2930.0,
+            gas_price_gwei: 0.5,  // Updated for Nov 2025 low-gas environment
+            eth_price_usd: 3000.0,
             default_input_usd: 10_000.0,
+            
+            // Reasonable limits
+            max_reasonable_return: 1.10, // 10% return is very high but possible
+            max_profit_usd: 10_000.0,    // $10K profit on single arb is suspicious
         }
     }
 
@@ -69,7 +81,12 @@ impl ProfitFilter {
     }
 
     pub fn set_gas_price(&mut self, gas_price_gwei: f64) {
-        self.gas_price_gwei = gas_price_gwei;
+        // Enforce minimum realistic gas price
+        self.gas_price_gwei = gas_price_gwei.max(1.0);
+    }
+    
+    pub fn set_default_input(&mut self, input_usd: f64) {
+        self.default_input_usd = input_usd;
     }
 
     fn calculate_gas_cost(&self, cycle: &ArbitrageCycle) -> f64 {
@@ -90,6 +107,47 @@ impl ProfitFilter {
         let gas_cost_eth = (total_gas_units as f64) * self.gas_price_gwei * 1e-9;
         gas_cost_eth * self.eth_price_usd
     }
+    
+    /// Check if a cycle looks suspicious (likely a bug)
+    fn check_suspicious(&self, cycle: &ArbitrageCycle, gross_profit_usd: f64) -> Option<String> {
+        // 1. Unrealistically high return (> 10%)
+        if cycle.expected_return > self.max_reasonable_return {
+            return Some(format!(
+                "Return {:.2}x exceeds reasonable limit of {:.2}x",
+                cycle.expected_return, self.max_reasonable_return
+            ));
+        }
+        
+        // 2. Unrealistically high profit
+        if gross_profit_usd > self.max_profit_usd {
+            return Some(format!(
+                "Profit ${:.2} exceeds reasonable limit of ${:.0}",
+                gross_profit_usd, self.max_profit_usd
+            ));
+        }
+        
+        // 3. Negative or zero expected return (broken math)
+        if cycle.expected_return <= 0.0 {
+            return Some("Expected return is non-positive".to_string());
+        }
+        
+        // 4. Non-finite expected return
+        if !cycle.expected_return.is_finite() {
+            return Some("Expected return is not finite".to_string());
+        }
+        
+        // 5. Cycle validation (already done in ArbitrageCycle::is_valid but double-check)
+        if !cycle.is_valid() {
+            return Some("Cycle failed validation (duplicate nodes or pools)".to_string());
+        }
+        
+        // 6. Too many hops (graph may have found a loop-the-loop)
+        if cycle.hop_count() > 6 {
+            return Some(format!("Too many hops: {}", cycle.hop_count()));
+        }
+        
+        None
+    }
 
     pub fn analyze(&self, cycle: &ArbitrageCycle, input_usd: Option<f64>) -> ProfitAnalysis {
         let input = input_usd.unwrap_or(self.default_input_usd);
@@ -98,9 +156,8 @@ impl ProfitFilter {
         let net_profit_usd = gross_profit_usd - gas_cost_usd;
         let is_profitable = net_profit_usd >= self.min_profit_usd;
         
-        let is_suspicious = cycle.expected_return > 1.5
-            || cycle.expected_return > 10.0
-            || gross_profit_usd.abs() > 1_000_000.0;
+        let suspicion_reason = self.check_suspicious(cycle, gross_profit_usd);
+        let is_suspicious = suspicion_reason.is_some();
 
         ProfitAnalysis {
             cycle: cycle.clone(),
@@ -110,6 +167,7 @@ impl ProfitFilter {
             net_profit_usd,
             is_profitable,
             is_suspicious,
+            suspicion_reason,
         }
     }
 
@@ -128,9 +186,10 @@ impl ProfitFilter {
             if analysis.is_suspicious {
                 suspicious_count += 1;
                 let path = analysis.format_path(symbols);
-                warn!(
-                    "⚠️ SUSPICIOUS (likely decimal bug): {} | Return: {:.2}x | Profit: ${:.2e}",
-                    path, cycle.expected_return, analysis.gross_profit_usd
+                let reason = analysis.suspicion_reason.as_deref().unwrap_or("Unknown");
+                debug!(
+                    "⚠️ SUSPICIOUS: {} | Reason: {}",
+                    path, reason
                 );
                 continue;
             }
@@ -176,7 +235,7 @@ impl ProfitFilter {
 
         if suspicious_count > 0 {
             warn!(
-                "⚠️ Flagged {} cycles as SUSPICIOUS (unrealistic returns - likely decimal bugs)",
+                "⚠️ Flagged {} cycles as SUSPICIOUS (check debug logs for details)",
                 suspicious_count
             );
         }
@@ -207,14 +266,18 @@ impl ProfitFilter {
             return;
         }
 
-        let valid_cycles: Vec<_> = cycles.iter()
-            .filter(|c| {
-                let analysis = self.analyze(c, None);
-                !analysis.is_suspicious
-            })
-            .collect();
+        // Separate valid from suspicious
+        let mut valid_cycles = Vec::new();
+        let mut suspicious_cycles = Vec::new();
         
-        let suspicious_count = cycles.len() - valid_cycles.len();
+        for c in cycles {
+            let analysis = self.analyze(c, None);
+            if analysis.is_suspicious {
+                suspicious_cycles.push((c, analysis.suspicion_reason));
+            } else {
+                valid_cycles.push(c);
+            }
+        }
 
         let cross_dex: Vec<_> = valid_cycles.iter().filter(|c| c.is_cross_dex()).collect();
         let single_dex: Vec<_> = valid_cycles.iter().filter(|c| !c.is_cross_dex()).collect();
@@ -225,7 +288,7 @@ impl ProfitFilter {
         println!("{}", style("═══ CYCLE ANALYSIS ═══").yellow().bold());
         println!();
         println!(
-            "Analysis parameters: Input=${:.0}, Gas={} gwei, ETH=${:.0}",
+            "Analysis parameters: Input=${:.0}, Gas={:.1} gwei, ETH=${:.0}",
             self.default_input_usd, self.gas_price_gwei, self.eth_price_usd
         );
         println!(
@@ -234,12 +297,30 @@ impl ProfitFilter {
         );
         println!();
         
-        if suspicious_count > 0 {
+        if !suspicious_cycles.is_empty() {
             println!(
-                "{} {} cycles with UNREALISTIC returns (likely decimal bugs)",
-                style("⚠️ Filtered out").red(),
-                suspicious_count
+                "{} {} cycles with invalid returns (bugs filtered out)",
+                style("⚠️ Excluded").red(),
+                suspicious_cycles.len()
             );
+            
+            // Show top 3 suspicious ones for debugging
+            for (cycle, reason) in suspicious_cycles.iter().take(3) {
+                let path: Vec<_> = cycle.path.iter()
+                    .map(|addr| {
+                        symbols
+                            .get(addr)
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| format!("0x{}...", &format!("{:?}", addr)[2..8]))
+                    })
+                    .collect();
+                debug!(
+                    "  - {} | Return: {:.2}x | Reason: {}",
+                    path.join(" → "),
+                    cycle.expected_return,
+                    reason.as_deref().unwrap_or("Unknown")
+                );
+            }
             println!();
         }
         

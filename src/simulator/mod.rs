@@ -1,15 +1,14 @@
-//! Phase 3: The Simulator
+//! Phase 3: The Simulator - FIXED Edition
 //! 
-//! Uses alloy Provider's call() for simulation instead of REVM.
-//! This is a simpler, more stable approach that many production MEV bots use.
+//! Uses alloy Provider's call() for simulation.
 //!
-//! Responsible for:
-//! - Simulating swaps via eth_call (using Uniswap Quoter contracts)
-//! - Calculating actual gas costs and profits
-//! - Validating arbitrage cycles
+//! FIXES:
+//! - Proper gas price handling with minimum floor
+//! - Dynamic simulation sizing based on token liquidity
+//! - Better error reporting
 
 mod quoter;
 pub mod swap_simulator;
 
 pub use quoter::UniV3Quoter;
-pub use swap_simulator::SwapSimulator;
+pub use swap_simulator::{SwapSimulator, ArbitrageSimulation, SwapResult, LiquidityTier};
