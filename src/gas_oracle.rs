@@ -27,7 +27,7 @@ const CACHE_DURATION_SECS: u64 = 10;
 const API_TIMEOUT_SECS: u64 = 5;
 
 /// Minimum sane gas price (0.1 gwei)
-const MIN_GAS_GWEI: f64 = 0.1;
+const MIN_GAS_GWEI: f64 = 0.01;
 
 /// Maximum sane gas price (1000 gwei - during extreme congestion)
 const MAX_GAS_GWEI: f64 = 1000.0;
