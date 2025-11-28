@@ -4,6 +4,7 @@ version = "0.3.0"
 edition = "2021"
 authors = ["Your Name <your@email.com>"]
 description = "Arbitrage detection bot for Uniswap V3/V4 + Multiple DEXes"
+default-run = "sniper"
 
 [dependencies]
 # ============================================

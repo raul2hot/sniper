@@ -189,6 +189,10 @@ pub struct Config {
     
     /// Pause duration after max failures (seconds)
     pub failure_pause_secs: u64,
+    
+    // ========== API Keys ==========
+    /// Etherscan API key for accurate gas prices
+    pub etherscan_api_key: Option<String>,
 }
 
 impl Config {
@@ -320,6 +324,9 @@ impl Config {
                 .unwrap_or_else(|_| "60".to_string())
                 .parse()
                 .unwrap_or(60),
+            
+            // API Keys
+            etherscan_api_key: env::var("ETHERSCAN_API_KEY").ok(),
         })
     }
     
@@ -499,6 +506,11 @@ impl Config {
             if self.flashbots_signer_key.is_some() { "✓ Configured" } else { "✗ Not Set" }
         );
         println!("╠════════════════════════════════════════════════════════════╣");
+        println!("║ GAS ORACLE                                                 ║");
+        println!("║ • Etherscan API:   {:^40} ║",
+            if self.etherscan_api_key.is_some() { "✓ Configured" } else { "✗ Using RPC" }
+        );
+        println!("╠════════════════════════════════════════════════════════════╣");
         println!("║ SAFETY                                                     ║");
         println!("║ • Emergency Stop:  {:^40} ║",
             if self.emergency_stop { "🛑 ACTIVE" } else { "✓ Inactive" }
@@ -542,6 +554,7 @@ impl Default for Config {
             emergency_stop: false,
             max_consecutive_failures: 5,
             failure_pause_secs: 60,
+            etherscan_api_key: None,
         }
     }
 }
