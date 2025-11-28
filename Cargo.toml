@@ -1,9 +1,9 @@
 [package]
 name = "sniper"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 authors = ["Your Name <your@email.com>"]
-description = "Arbitrage detection bot for Uniswap V3/V4 + Multiple DEXes"
+description = "Arbitrage detection and execution bot for Uniswap V3/V4 + Multiple DEXes"
 default-run = "sniper"
 
 [dependencies]
@@ -21,6 +21,16 @@ alloy-rpc-types = "1.0"
 alloy-eips = "1.0"
 alloy-network = "1.0"
 
+# ============================================
+# PHASE 4: Transaction Signing & Execution
+# ============================================
+
+# Signing support
+alloy-signer = "1.0"
+alloy-signer-local = "1.0"
+alloy-consensus = "1.0"
+alloy-rlp = "0.3"
+
 # Async runtime (required for alloy)
 tokio = { version = "1.42", features = ["full"] }
 
@@ -37,11 +47,6 @@ serde_json = "1.0"
 
 # Graph data structure & algorithms (Bellman-Ford)
 petgraph = "0.8"
-
-# ============================================
-# PHASE 3: The Simulator (Provider-based)
-# ============================================
-# Using alloy Provider's call() instead of REVM for simpler, more stable simulation
 
 # ============================================
 # PHASE 4: The Executor (Flash Loans + Flashbots)
@@ -82,12 +87,31 @@ indicatif = "0.17"  # Progress bars
 # Hex encoding
 hex = "0.4"
 
-# Lazy static for global caching (NEW - for RPC optimization)
+# Lazy static for global caching
 lazy_static = "1.4"
+
+# Random number generation (for wallet generation)
+rand = "0.8"
 
 [dev-dependencies]
 # Testing utilities
 tokio-test = "0.4"
+
+[[bin]]
+name = "sniper"
+path = "src/main.rs"
+
+[[bin]]
+name = "diagnose"
+path = "src/bin/diagnose.rs"
+
+[[bin]]
+name = "generate-wallet"
+path = "src/bin/generate_wallet.rs"
+
+[[bin]]
+name = "deploy-check"
+path = "src/bin/deploy_check.rs"
 
 [profile.release]
 # Optimize for speed in production

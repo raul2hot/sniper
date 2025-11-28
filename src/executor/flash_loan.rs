@@ -1,4 +1,4 @@
-//! Flash Loan Executor - Phase 4
+//! Flash Loan Executor - Phase 4 (PRODUCTION READY)
 //!
 //! This module handles the Flash Loan integration for executing arbitrage.
 //! Currently supports:
@@ -59,25 +59,25 @@ sol! {
         ) external;
     }
     
-    /// Our executor contract interface
+    /// Our executor contract interface (matches ArbitrageExecutor.sol)
     interface IArbitrageExecutor {
         /// Execute an arbitrage cycle with a flash loan
-        function executeArbitrage(
+        /// @param path Token addresses [A, B, C, A] - must start and end same
+        /// @param swapInfo Packed array: each element = (fee << 8) | dexType
+        /// @param amount Flash loan amount
+        /// @param minOut Minimum output (should be > amount for profit)
+        function execute(
             address[] calldata path,
-            address[] calldata pools,
-            uint8[] calldata dexTypes,
-            uint256 inputAmount,
-            uint256 minOutput
+            uint32[] calldata swapInfo,
+            uint256 amount,
+            uint256 minOut
         ) external returns (uint256 profit);
         
         /// Withdraw accumulated profits
-        function withdrawProfits(address token) external;
+        function withdraw(address token) external;
         
-        /// Emergency stop
-        function pause() external;
-        
-        /// Resume operations
-        function unpause() external;
+        /// Withdraw ETH
+        function withdrawETH() external;
     }
     
     /// Uniswap V3 Router for swaps
@@ -155,6 +155,16 @@ impl FlashLoanBuilder {
         }
     }
     
+    /// Check if we have an executor configured
+    pub fn has_executor(&self) -> bool {
+        self.executor_address.is_some()
+    }
+    
+    /// Get the executor address
+    pub fn executor_address(&self) -> Option<Address> {
+        self.executor_address
+    }
+    
     /// Build a flash loan transaction for the given arbitrage cycle
     pub fn build_flash_loan_tx(
         &self,
@@ -186,13 +196,32 @@ impl FlashLoanBuilder {
             }
         };
         
+        // Estimate gas (rough estimate, will be refined by simulation)
+        let gas_estimate = self.estimate_gas(cycle);
+        
         Ok(FlashLoanTransaction {
             to,
             calldata,
             value: U256::ZERO,
-            gas_limit: 1_000_000, // Will be estimated properly
+            gas_limit: gas_estimate,
             provider: self.provider,
         })
+    }
+    
+    /// Estimate gas for a cycle
+    fn estimate_gas(&self, cycle: &ArbitrageCycle) -> u64 {
+        let base_gas = 100_000u64; // Base overhead
+        let per_swap_v3 = 150_000u64;
+        let per_swap_v2 = 100_000u64;
+        
+        let swap_gas: u64 = cycle.dexes.iter().map(|dex| {
+            match dex {
+                Dex::UniswapV3 | Dex::SushiswapV3 | Dex::PancakeSwapV3 => per_swap_v3,
+                _ => per_swap_v2,
+            }
+        }).sum();
+        
+        base_gas + swap_gas
     }
     
     /// Build Balancer V2 flash loan calldata
@@ -243,15 +272,22 @@ impl FlashLoanBuilder {
     ) -> Result<Bytes> {
         // Convert cycle data to contract-compatible format
         let path: Vec<Address> = cycle.path.clone();
-        let pools: Vec<Address> = cycle.pools.clone();
-        let dex_types: Vec<u8> = cycle.dexes.iter().map(|d| DexType::from(*d) as u8).collect();
         
-        let call = IArbitrageExecutor::executeArbitrageCall {
+        // Pack dexType and fee into single u32: (fee << 8) | dexType
+        let swap_info: Vec<u32> = cycle.dexes.iter()
+            .zip(cycle.fees.iter())
+            .map(|(dex, &fee)| {
+                let dex_type = DexType::from(*dex) as u32;
+                let fee_u32 = fee.min(10000);
+                (fee_u32 << 8) | dex_type
+            })
+            .collect();
+        
+        let call = IArbitrageExecutor::executeCall {
             path,
-            pools,
-            dexTypes: dex_types,
-            inputAmount: input_amount,
-            minOutput: min_output,
+            swapInfo: swap_info,
+            amount: input_amount,
+            minOut: min_output,
         };
         
         Ok(Bytes::from(call.abi_encode()))
@@ -284,7 +320,7 @@ pub struct FlashLoanTransaction {
 }
 
 impl FlashLoanTransaction {
-    /// Estimate gas for this transaction
+    /// Estimate gas for this transaction using RPC
     pub async fn estimate_gas(&self, rpc_url: &str, from: Address) -> Result<u64> {
         let provider = ProviderBuilder::new()
             .on_http(rpc_url.parse()?);
@@ -298,7 +334,8 @@ impl FlashLoanTransaction {
         let gas = provider.estimate_gas(tx).await
             .map_err(|e| eyre!("Gas estimation failed: {}", e))?;
         
-        Ok(gas as u64)
+        // Add 20% buffer for safety
+        Ok((gas as u64) * 120 / 100)
     }
     
     /// Convert to a TransactionRequest for signing
