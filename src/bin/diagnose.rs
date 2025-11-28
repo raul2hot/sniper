@@ -107,7 +107,7 @@ fn main() {
     println!("  • Gas at 0.5 gwei: ~$0.50 per trade");
     println!("  • Gas at 20 gwei: ~$20 per trade");
     
-    if min_profit < 10.0 {
+    if min_profit < 2.0 {
         println!("\n  ⚠️  Low threshold! You'll see many opportunities that");
         println!("     may not be profitable after real-world slippage.");
     }

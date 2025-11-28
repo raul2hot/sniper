@@ -445,9 +445,9 @@ impl Config {
                     "Production mode requires EXECUTOR_CONTRACT_ADDRESS (deploy the executor first)"
                 ));
             }
-            if self.min_profit_usd < 10.0 {
+            if self.min_profit_usd < 2.0 {
                 return Err(eyre::eyre!(
-                    "Production mode requires MIN_PROFIT_USD >= $10 (currently ${:.2})",
+                    "Production mode requires MIN_PROFIT_USD >= $2 (currently ${:.2})",
                     self.min_profit_usd
                 ));
             }

@@ -208,7 +208,7 @@ async fn main() {
         .unwrap_or(90.0);
     
     println!("   MIN_PROFIT_USD: ${:.2}", min_profit);
-    if min_profit < 10.0 {
+    if min_profit < 2.0 {
         warnings.push("MIN_PROFIT_USD is very low".to_string());
         println!("     ⚠️  This is quite low, you may see false positives");
     }
