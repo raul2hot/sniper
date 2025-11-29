@@ -504,13 +504,20 @@ impl CurveNGFetcher {
         let mut states = Vec::new();
         
         for pool in ng_pools {
-            // For each pool, create edges for all coin pairs
             for i in 0..pool.n_coins {
                 for j in 0..pool.n_coins {
-                    if i != j {
-                        if let Some(state) = pool.to_pool_state(i, j) {
-                            states.push(state);
-                        }
+                    if i == j { continue; }
+                    
+                    // FILTER: Skip invalid token addresses
+                    let token_i = pool.coins[i];
+                    let token_j = pool.coins[j];
+                    if !Self::is_valid_address(&token_i) || !Self::is_valid_address(&token_j) {
+                        debug!("Skipping invalid token in pool {:?}", pool.address);
+                        continue;
+                    }
+                    
+                    if let Some(state) = pool.to_pool_state(i, j) {
+                        states.push(state);
                     }
                 }
             }
@@ -518,6 +525,13 @@ impl CurveNGFetcher {
         
         debug!("Converted {} NG pools to {} graph edges", ng_pools.len(), states.len());
         states
+    }
+    
+    /// Check if address is valid (not a placeholder/error)
+    fn is_valid_address(addr: &Address) -> bool {
+        // Count non-zero bytes
+        let non_zero = addr.as_slice().iter().filter(|&&b| b != 0).count();
+        non_zero >= 8  // Real addresses have many non-zero bytes
     }
 }
 

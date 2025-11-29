@@ -21,7 +21,7 @@ mod executor;
 mod gas_oracle;
 
 use brain::{BoundedBellmanFord, ProfitFilter, ArbitrageCycle};
-use cartographer::{ArbitrageGraph, ExpandedPoolFetcher, Dex};
+use cartographer::{ArbitrageGraph, ExpandedPoolFetcher, Dex, build_expanded_symbol_map};
 use config::{Config, ExecutionMode};
 use simulator::SwapSimulator;
 use executor::ExecutionEngine;
@@ -36,25 +36,10 @@ fn print_banner() {
 }
 
 fn build_token_symbols() -> HashMap<Address, &'static str> {
-    let mut map = HashMap::new();
-    let tokens = [
-        ("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", "WETH"),
-        ("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", "USDC"),
-        ("0xdAC17F958D2ee523a2206206994597C13D831ec7", "USDT"),
-        ("0x6B175474E89094C44Da98b954EedcdeCB5BE3830", "DAI"),
-        ("0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599", "WBTC"),
-        ("0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0", "wstETH"),
-        ("0x514910771AF9Ca656af840dff83E8264EcF986CA", "LINK"),
-        ("0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984", "UNI"),
-        ("0x6982508145454Ce325dDbE47a25d4ec3d2311933", "PEPE"),
-    ];
-    for (addr, symbol) in tokens {
-        if let Ok(address) = addr.parse() {
-            map.insert(address, symbol);
-        }
-    }
-    map
+    // Use the expanded symbol map from cartographer
+    build_expanded_symbol_map()
 }
+
 
 fn format_token(addr: &Address, symbols: &HashMap<Address, &str>) -> String {
     symbols.get(addr).map(|s| s.to_string())
@@ -358,7 +343,14 @@ async fn run_scan(
 
     // Build graph
     let graph = ArbitrageGraph::from_pools(&pools);
-    println!("DEBUG: Graph has {} nodes, {} edges", graph.node_count(), graph.edge_count());
+    // Debug: List tokens in graph
+    let symbol_map = build_token_symbols(); // or build_expanded_symbol_map()
+    println!("\n=== TOKENS IN GRAPH ({}) ===", graph.node_count());
+    for (addr, _) in &graph.token_to_node {
+        let sym = symbol_map.get(addr).copied().unwrap_or("???");
+        println!("  {}: {:?}", sym, addr);
+    }
+    println!("===========================\n");
     // Find cycles
     let bellman_ford = BoundedBellmanFord::new(&graph, config.max_hops);
     let base_tokens = config.base_token_addresses();
@@ -399,6 +391,28 @@ async fn run_scan(
     // Sort by expected return and take top candidates
     let mut sorted = cycles;
     sorted.sort_by(|a, b| b.expected_return.partial_cmp(&a.expected_return).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Detailed cycle debug
+    println!("\n=== TOP 3 CYCLES DETAILED ===");
+    for (i, cycle) in sorted.iter().take(3).enumerate() {
+        println!("\nCycle #{} (return: {:.6})", i, cycle.expected_return);
+        
+        let mut cumulative = 1.0_f64;
+        for j in 0..cycle.pools.len() {
+            let from = symbol_map.get(&cycle.path[j]).copied().unwrap_or("???");
+            let to = symbol_map.get(&cycle.path[j + 1]).copied().unwrap_or("???");
+            let price = cycle.prices[j];
+            let fee = cycle.fees[j];
+            let fee_mult = 1.0 - (fee as f64 / 1_000_000.0);
+            let step_return = price * fee_mult;
+            cumulative *= step_return;
+            
+            println!("  Step {}: {} → {}", j + 1, from, to);
+            println!("         price={:.8}, fee={}bps, step_return={:.8}, cumulative={:.8}",
+                price, fee, step_return, cumulative);
+        }
+    }
+    println!("=== END DETAILED ===\n");
 
     // Show top 3 expected returns before filtering
     for (i, c) in sorted.iter().take(3).enumerate() {

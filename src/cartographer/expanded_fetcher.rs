@@ -22,6 +22,22 @@ use super::curve_ng::{CurveNGFetcher, CurveNGPool};
 use super::sky_ecosystem::{SkyAdapter, ERC4626State, SUSDS_TOKEN, USDS_TOKEN, SDAI_TOKEN, DAI_TOKEN};
 use super::usd3_reserve::{USD3Adapter, USD3State, USD3_TOKEN};
 
+
+// ============================================
+// BLOCKED TOKENS (known scams/fakes)
+// ============================================
+
+/// Known scam/fake token addresses to filter out
+const BLOCKED_TOKENS: [&str; 1] = [
+    "6b175474e89094c44da98b954eedeac495271d0f", // Fake DAI (different from real DAI)
+];
+
+/// Check if a token address is blocked
+fn is_blocked_token(addr: &Address) -> bool {
+    let addr_str = format!("{:?}", addr).to_lowercase();
+    BLOCKED_TOKENS.iter().any(|blocked| addr_str.contains(blocked))
+}
+
 // ============================================
 // PRIORITY TOKENS (Phase 4)
 // ============================================
@@ -70,6 +86,31 @@ pub fn build_expanded_symbol_map() -> HashMap<Address, &'static str> {
         map.insert(addr, symbol);
     }
     
+    // Add tokens discovered from Curve NG
+    let additional: [(&str, &str); 15] = [
+        ("0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0", "wstETH"),
+        ("0x514910771AF9Ca656af840dff83E8264EcF986CA", "LINK"),
+        ("0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984", "UNI"),
+        ("0x6982508145454Ce325dDbE47a25d4ec3d2311933", "PEPE"),
+        ("0x95aD61b0a150d79219dCF64E1E6Cc01f0B64C4cE", "SHIB"),
+        ("0x7Fc66500c84A76Ad7e9c93437bFc5Ac33E2DDaE9", "AAVE"),
+        ("0x4c9EDD5852cd905f086C759E8383e09bff1E68B3", "USDe"),
+        ("0xCd5fE23C85820F7B72D0926FC9b05b43E359b7ee", "weETH"),
+        ("0xae78736Cd615f374D3085123A210448E74Fc6393", "rETH"),
+        ("0xBe9895146f7AF43049ca1c1AE358B0541Ea49704", "cbETH"),
+        ("0x0655977FEb2f289A4aB78af67BAB0d17aAb84367", "scrvUSD"),
+        ("0xae7ab96520DE3A18E5e111B5EaAb095312D7fE84", "stETH"),
+        ("0x4591DBfF62656E7859Afe5e45f6f47D3669fBB28", "OETH"),
+        ("0x73968b9a57c6E53d41345FD57a6E6ae27d6CDb2F", "sUSDe"),
+        ("0x5Ca135cB8527d76e932f34B5145575F9d8cBe08E", "PT-sUSDe"),
+    ];
+    
+    for (addr_str, symbol) in additional {
+        if let Ok(addr) = addr_str.parse::<Address>() {
+            map.insert(addr, symbol);
+        }
+    }
+    
     map
 }
 
@@ -86,15 +127,15 @@ pub fn get_new_priority_pools() -> Vec<NewPoolInfo> {
         
         // USDS/DAI - Sky migration pool (1:1 swap)
         NewPoolInfo {
-            address: "0x... TODO: Discover from Curve NG",
+            address: "0x3225737a9Bbb6473CB4a45b7244ACa2BeFdB276A", // DAI_USDS_CONVERTER
             token0: USDS_TOKEN,
             token1: DAI_TOKEN,
             token0_symbol: "USDS",
             token1_symbol: "DAI",
-            fee: 1, // 0.01% - very low for 1:1 pairs
+            fee: 1,
             dex: Dex::Curve,
             pool_type: PoolType::Curve,
-            note: "DAI migration - look for friction arb",
+            note: "DAI-USDS 1:1 migration bridge",
         },
         
         // ============================================
@@ -211,7 +252,84 @@ pub struct ExpandedPoolFetcher {
     sky_adapter: SkyAdapter,
     usd3_adapter: USD3Adapter,
 }
+// ============================================
+// POOL QUALITY FILTER
+// ============================================
 
+/// Filter out suspicious/scam pools that create false arbitrage signals
+fn filter_suspicious_pools(pools: Vec<PoolState>) -> Vec<PoolState> {
+    let symbol_map = build_expanded_symbol_map();
+    let before_count = pools.len();
+    
+    let filtered: Vec<PoolState> = pools.into_iter().filter(|pool| {
+        // 1. Check for blocked tokens
+        if is_blocked_token(&pool.token0) || is_blocked_token(&pool.token1) {
+            debug!("Filtered blocked token in pool {:?}", pool.address);
+            return false;
+        }
+        
+        // 2. Get symbols
+        let t0 = symbol_map.get(&pool.token0).copied().unwrap_or("???");
+        let t1 = symbol_map.get(&pool.token1).copied().unwrap_or("???");
+        
+        // 3. Skip pools with unknown tokens (for now - safer)
+        if t0 == "???" || t1 == "???" {
+            debug!("Filtered unknown token: {} / {} @ {:?}", t0, t1, pool.address);
+            return false;
+        }
+        
+        // 4. Check price sanity
+        let price = pool.normalized_price();
+        if price <= 0.0 || !price.is_finite() || price > 1e15 {
+            debug!("Filtered invalid price {} for {:?}", price, pool.address);
+            return false;
+        }
+        
+        // 5. Stablecoin pairs should have price ~1.0
+        let stables = ["USDC", "USDT", "DAI", "USDS", "FRAX", "crvUSD", "GHO", "DOLA", "pyUSD", "USDe", "USD3"];
+        let is_t0_stable = stables.contains(&t0);
+        let is_t1_stable = stables.contains(&t1);
+        
+        if is_t0_stable && is_t1_stable {
+            // Both are stablecoins - price should be 0.95 to 1.05
+            if price < 0.95 || price > 1.05 {
+                debug!("Filtered depegged stable pair: {} / {} price={:.4} @ {:?}", 
+                    t0, t1, price, pool.address);
+                return false;
+            }
+        }
+        
+        // 6. Yield-bearing tokens against stables should be ~1.0 to 1.15
+        let yield_tokens = ["sDAI", "sUSDS", "sUSDe", "scrvUSD", "sFRAX"];
+        let is_t0_yield = yield_tokens.contains(&t0);
+        let is_t1_yield = yield_tokens.contains(&t1);
+        
+        if (is_t0_yield && is_t1_stable) || (is_t1_yield && is_t0_stable) {
+            if price < 0.90 || price > 1.20 {
+                debug!("Filtered suspicious yield/stable pair: {} / {} price={:.4} @ {:?}",
+                    t0, t1, price, pool.address);
+                return false;
+            }
+        }
+        
+        // 7. Minimum liquidity check (if meaningful liquidity data exists)
+        // Skip pools with < $100 equivalent liquidity
+        let min_liquidity = 100 * 10u128.pow(18); // $100 in 18 decimals
+        if pool.liquidity > 0 && pool.liquidity < min_liquidity {
+            debug!("Filtered low liquidity pool: {:?}", pool.address);
+            return false;
+        }
+        
+        true
+    }).collect();
+    
+    let removed = before_count - filtered.len();
+    if removed > 0 {
+        info!("🧹 Filtered {} suspicious pools ({} remaining)", removed, filtered.len());
+    }
+    
+    filtered
+}
 impl ExpandedPoolFetcher {
     pub fn new(rpc_url: String) -> Self {
         Self {
@@ -233,21 +351,35 @@ impl ExpandedPoolFetcher {
         let existing_pools = self.fetch_existing_pools().await?;
         result.existing_pools = existing_pools.len();
         result.pool_states.extend(existing_pools);
+
+        // =====================================================
+        // ADD THIS SECTION (NEW STEP 1.5)
+        // =====================================================
+        // 1.5. Add static bridging pools (connects ecosystems)
+        info!("🔗 Adding bridging pools...");
+        let bridging_count = self.add_bridging_pools(&mut result.pool_states).await;
+        info!("   Added {} bridging pool edges", bridging_count);
+        // =====================================================
         
         // 2. Discover Curve NG pools
         info!("🔍 Discovering Curve NG pools...");
-        // match self.curve_ng_fetcher.discover_all_ng_pools().await {
-        //     Ok(ng_pools) => {
-        //         let states = self.curve_ng_fetcher.convert_to_pool_states(&ng_pools);
-        //         result.curve_ng_pools = ng_pools.len();
-        //         result.curve_ng_states = states.len();
-        //         result.pool_states.extend(states);
-        //         result.ng_pool_details = ng_pools;
-        //     }
-        //     Err(e) => {
-        //         warn!("Failed to discover Curve NG pools: {}", e);
-        //     }
-        // }
+        match self.curve_ng_fetcher.discover_all_ng_pools().await {
+            Ok(ng_pools) => {
+                let states = self.curve_ng_fetcher.convert_to_pool_states(&ng_pools);
+                result.curve_ng_pools = ng_pools.len();
+                result.curve_ng_states = states.len();
+                result.pool_states.extend(states);
+                result.ng_pool_details = ng_pools;
+            }
+            Err(e) => {
+                warn!("Failed to discover Curve NG pools: {}", e);
+            }
+        }
+
+        // Add after Curve NG discovery:
+        for ng_pool in &result.ng_pool_details {
+            debug!("  NG Pool {:?}: {} coins", ng_pool.address, ng_pool.n_coins);
+        }
         
         // 3. Fetch Sky ecosystem state
         info!("🌤️ Fetching Sky ecosystem state...");
@@ -294,6 +426,17 @@ impl ExpandedPoolFetcher {
             result.fetch_duration
         );
         
+        // ============================================
+        // FILTER: Remove suspicious/scam pools
+        // ============================================
+        let before_filter = result.pool_states.len();
+        result.pool_states = filter_suspicious_pools(result.pool_states);
+        let after_filter = result.pool_states.len();
+        
+        if before_filter != after_filter {
+            info!("🧹 Pool filter: {} → {} pools", before_filter, after_filter);
+        }
+        
         Ok(result)
     }
     
@@ -304,6 +447,65 @@ impl ExpandedPoolFetcher {
         fetcher.fetch_all_pools().await
     }
     
+    /// Add bridging pools WITH actual on-chain prices
+    async fn add_bridging_pools(&self, pool_states: &mut Vec<PoolState>) -> usize {
+        let mut count = 0;
+        
+        for pool_info in get_new_priority_pools() {
+            if pool_info.address.starts_with("0x...") || pool_info.address.len() < 20 {
+                continue;
+            }
+            
+            let Ok(pool_address) = pool_info.address.parse::<Address>() else {
+                continue;
+            };
+            
+            // Fetch actual price from the pool
+            let price = match self.fetch_curve_price(pool_address, 0, 1).await {
+                Ok(p) if p > 0.0 && p.is_finite() => p,
+                _ => {
+                    // Fallback to 1.0 for stablecoin pairs
+                    warn!("Could not fetch price for {:?}, using 1.0", pool_address);
+                    1.0
+                }
+            };
+            
+            let d0 = get_token_decimals(&pool_info.token0);
+            let d1 = get_token_decimals(&pool_info.token1);
+            let sqrt_price = price.sqrt() * 2_f64.powi(96) * 10_f64.powi((d1 as i32 - d0 as i32) / 2);
+            
+            let state = PoolState {
+                address: pool_address,
+                token0: pool_info.token0,
+                token1: pool_info.token1,
+                token0_decimals: d0,
+                token1_decimals: d1,
+                sqrt_price_x96: U256::from(sqrt_price as u128),
+                tick: 0,
+                liquidity: 10u128.pow(24),
+                reserve1: 10u128.pow(24),
+                fee: pool_info.fee,
+                is_v4: false,
+                dex: pool_info.dex,
+                pool_type: pool_info.pool_type,
+                weight0: 5 * 10u128.pow(17),
+            };
+            
+            pool_states.push(state);
+            count += 1;
+        }
+        
+        count
+    }
+
+    /// Fetch price from Curve pool
+    async fn fetch_curve_price(&self, pool: Address, i: i128, j: i128) -> Result<f64> {
+        // Use get_dy to quote 1e18 of token i for token j
+        let dx = U256::from(10u64.pow(18));
+        let dy = self.curve_ng_fetcher.get_dy(pool, i, j, dx).await?;
+        let price = dy.to::<u128>() as f64 / dx.to::<u128>() as f64;
+        Ok(price)
+    }
     /// Convert virtual ERC-4626 pool to PoolState
     fn virtual_pool_to_state(
         &self,
