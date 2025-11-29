@@ -21,8 +21,8 @@ use super::{Dex, PoolState, PoolType, get_token_decimals};
 use super::curve_ng::{CurveNGFetcher, CurveNGPool};
 use super::sky_ecosystem::{SkyAdapter, ERC4626State, SUSDS_TOKEN, USDS_TOKEN, SDAI_TOKEN, DAI_TOKEN};
 use super::usd3_reserve::{USD3Adapter, USD3State, USD3_TOKEN};
-
-
+use crate::tokens::build_symbol_map as build_base_symbol_map;
+use std::collections::HashSet;
 // ============================================
 // BLOCKED TOKENS (known scams/fakes)
 // ============================================
@@ -79,14 +79,24 @@ pub fn get_priority_tokens() -> Vec<(Address, &'static str, u8)> {
 }
 
 /// Build token symbol map including new tokens
+/// Build token symbol map including new tokens
+/// FIXED: Now merges with tokens from tokens.rs
 pub fn build_expanded_symbol_map() -> HashMap<Address, &'static str> {
     let mut map = HashMap::new();
     
+    // STEP 1: Load ALL tokens from tokens.rs FIRST
+    // This includes USDC, WBTC, crvUSD, sDAI, pyUSD, etc.
+    let base_map = build_base_symbol_map();
+    for (addr, symbol) in base_map {
+        map.insert(addr, symbol);
+    }
+    
+    // STEP 2: Add priority tokens (may override some)
     for (addr, symbol, _) in get_priority_tokens() {
         map.insert(addr, symbol);
     }
     
-    // Add tokens discovered from Curve NG
+    // STEP 3: Add tokens discovered from Curve NG
     let additional: [(&str, &str); 15] = [
         ("0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0", "wstETH"),
         ("0x514910771AF9Ca656af840dff83E8264EcF986CA", "LINK"),
@@ -107,13 +117,12 @@ pub fn build_expanded_symbol_map() -> HashMap<Address, &'static str> {
     
     for (addr_str, symbol) in additional {
         if let Ok(addr) = addr_str.parse::<Address>() {
-            map.insert(addr, symbol);
+            map.entry(addr).or_insert(symbol);
         }
     }
     
     map
 }
-
 // ============================================
 // STATIC POOL DEFINITIONS (Phase 4 Priority)
 // ============================================
@@ -256,67 +265,152 @@ pub struct ExpandedPoolFetcher {
 // POOL QUALITY FILTER
 // ============================================
 
-/// Filter out suspicious/scam pools that create false arbitrage signals
+/// Known legitimate tokens - these should NEVER be filtered
+fn get_whitelisted_tokens() -> HashSet<Address> {
+    [
+        // Major tokens
+        "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", // WETH
+        "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", // USDC
+        "0xdAC17F958D2ee523a2206206994597C13D831ec7", // USDT
+        "0x6B175474E89094C44Da98b954EesdeACB5BE3830", // DAI
+        "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599", // WBTC
+        // Stablecoins
+        "0x853d955aCEf822Db058eb8505911ED77F175b99e", // FRAX
+        "0xf939E0A03FB07F59A73314E73794Be0E57ac1b4E", // crvUSD
+        "0x6c3ea9036406852006290770BEdFcAbA0e23A0e8", // pyUSD
+        "0x0000206329b97DB379d5E1Bf586BbDB969C63274", // USDA
+        "0x865377367054516e17014CcdED1e7d814EDC9ce4", // DOLA
+        // Yield tokens
+        "0x83F20F44975D03b1b09e64809B757c47f942BEeA", // sDAI
+        "0xdC035D45d973E3EC169d2276DDab16f1e407384F", // USDS
+        "0xa3931d71877C0E7a3148CB7Eb4463524FEc27fbD", // sUSDS
+        "0x4c9EDD5852cd905f086C759E8383e09bff1E68B3", // USDe
+        "0x9D39A5DE30e57443BfF2A8307A4256c8797A3497", // sUSDe
+        // LSTs
+        "0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0", // wstETH
+        "0xae78736Cd615f374D3085123A210448E74Fc6393", // rETH
+        "0xBe9895146f7AF43049ca1c1AE358B0541Ea49704", // cbETH
+        // DeFi tokens
+        "0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984", // UNI
+        "0x7Fc66500c84A76Ad7e9c93437bFc5Ac33E2DDaE9", // AAVE
+        "0x514910771AF9Ca656af840dff83E8264EcF986CA", // LINK
+        "0xD533a949740bb3306d119CC777fa900bA034cd52", // CRV
+        "0xba100000625a3754423978a60c9317c58a424e3D", // BAL
+        // Meme coins (legitimate high-volume)
+        "0x6982508145454Ce325dDbE47a25d4ec3d2311933", // PEPE
+        "0x95aD61b0a150d79219dCF64E1E6Cc01f0B64C4cE", // SHIB
+    ]
+    .iter()
+    .filter_map(|s| s.parse().ok())
+    .collect()
+}
+
+/// Known stablecoins for price validation
+fn get_stablecoins() -> HashSet<Address> {
+    [
+        "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", // USDC
+        "0xdAC17F958D2ee523a2206206994597C13D831ec7", // USDT
+        "0x6B175474E89094C44Da98b954EedeACB5BE3830", // DAI
+        "0x853d955aCEf822Db058eb8505911ED77F175b99e", // FRAX
+        "0xf939E0A03FB07F59A73314E73794Be0E57ac1b4E", // crvUSD
+        "0x6c3ea9036406852006290770BEdFcAbA0e23A0e8", // pyUSD
+        "0x865377367054516e17014CcdED1e7d814EDC9ce4", // DOLA
+        "0xdC035D45d973E3EC169d2276DDab16f1e407384F", // USDS
+        "0x4c9EDD5852cd905f086C759E8383e09bff1E68B3", // USDe
+    ]
+    .iter()
+    .filter_map(|s| s.parse().ok())
+    .collect()
+}
+
+/// Known yield-bearing stablecoins (trade at premium to $1)
+fn get_yield_stablecoins() -> HashSet<Address> {
+    [
+        "0x83F20F44975D03b1b09e64809B757c47f942BEeA", // sDAI (~1.05-1.20)
+        "0xa3931d71877C0E7a3148CB7Eb4463524FEc27fbD", // sUSDS (~1.0-1.15)
+        "0x9D39A5DE30e57443BfF2A8307A4256c8797A3497", // sUSDe (~1.0-1.15)
+    ]
+    .iter()
+    .filter_map(|s| s.parse().ok())
+    .collect()
+}
+
+
+/// Filter suspicious pools with smart validation
 fn filter_suspicious_pools(pools: Vec<PoolState>) -> Vec<PoolState> {
     let symbol_map = build_expanded_symbol_map();
+    let whitelist = get_whitelisted_tokens();
+    let stablecoins = get_stablecoins();
+    let yield_stables = get_yield_stablecoins();
     let before_count = pools.len();
     
     let filtered: Vec<PoolState> = pools.into_iter().filter(|pool| {
-        // 1. Check for blocked tokens
-        if is_blocked_token(&pool.token0) || is_blocked_token(&pool.token1) {
-            debug!("Filtered blocked token in pool {:?}", pool.address);
+        let t0_addr = pool.token0;
+        let t1_addr = pool.token1;
+        let t0 = symbol_map.get(&t0_addr).copied().unwrap_or("???");
+        let t1 = symbol_map.get(&t1_addr).copied().unwrap_or("???");
+        
+        // 1. Never filter pools with whitelisted tokens
+        let t0_whitelisted = whitelist.contains(&t0_addr);
+        let t1_whitelisted = whitelist.contains(&t1_addr);
+        
+        // 2. Block known bad tokens
+        if is_blocked_token(&t0_addr) || is_blocked_token(&t1_addr) {
+            debug!("Filtered blocked token: {} / {}", t0, t1);
             return false;
         }
         
-        // 2. Get symbols
-        let t0 = symbol_map.get(&pool.token0).copied().unwrap_or("???");
-        let t1 = symbol_map.get(&pool.token1).copied().unwrap_or("???");
-        
-        // 3. Skip pools with unknown tokens (for now - safer)
-        if t0 == "???" || t1 == "???" {
-            debug!("Filtered unknown token: {} / {} @ {:?}", t0, t1, pool.address);
-            return false;
-        }
-        
-        // 4. Check price sanity
+        // 3. Basic price sanity
         let price = pool.normalized_price();
-        if price <= 0.0 || !price.is_finite() || price > 1e15 {
-            debug!("Filtered invalid price {} for {:?}", price, pool.address);
+        if price <= 0.0 || !price.is_finite() {
+            debug!("Filtered zero/invalid price: {:?} ({}/{})", pool.address, t0, t1);
             return false;
         }
         
-        // 5. Stablecoin pairs should have price ~1.0
-        let stables = ["USDC", "USDT", "DAI", "USDS", "FRAX", "crvUSD", "GHO", "DOLA", "pyUSD", "USDe", "USD3"];
-        let is_t0_stable = stables.contains(&t0);
-        let is_t1_stable = stables.contains(&t1);
+        // 4. If BOTH tokens are whitelisted, always allow
+        if t0_whitelisted && t1_whitelisted {
+            return true;
+        }
         
-        if is_t0_stable && is_t1_stable {
-            // Both are stablecoins - price should be 0.95 to 1.05
-            if price < 0.95 || price > 1.05 {
-                debug!("Filtered depegged stable pair: {} / {} price={:.4} @ {:?}", 
-                    t0, t1, price, pool.address);
+        // 5. If at least one token is whitelisted, apply lenient checks
+        if t0_whitelisted || t1_whitelisted {
+            // Allow wide price range for mixed pairs
+            if price > 1e12 || price < 1e-12 {
+                debug!("Filtered extreme price {} for {:?}", price, pool.address);
+                return false;
+            }
+            return true;
+        }
+        
+        // 6. Both tokens unknown - be more careful
+        if t0 == "???" && t1 == "???" {
+            debug!("Filtered both unknown: {:?}", pool.address);
+            return false;
+        }
+        
+        // 7. Stablecoin pair price validation (both are stables)
+        let t0_stable = stablecoins.contains(&t0_addr);
+        let t1_stable = stablecoins.contains(&t1_addr);
+        let t0_yield = yield_stables.contains(&t0_addr);
+        let t1_yield = yield_stables.contains(&t1_addr);
+        
+        if t0_stable && t1_stable {
+            // Regular stable/stable should be ~1.0 (0.95 - 1.05)
+            if price < 0.90 || price > 1.10 {
+                debug!("Filtered bad stable/stable price {}: {:?} ({}/{})", price, pool.address, t0, t1);
+                return false;
+            }
+        } else if (t0_stable && t1_yield) || (t0_yield && t1_stable) {
+            // Yield stable vs regular stable (0.85 - 1.25 range)
+            if price < 0.80 || price > 1.30 {
+                debug!("Filtered bad yield-stable price {}: {:?} ({}/{})", price, pool.address, t0, t1);
                 return false;
             }
         }
         
-        // 6. Yield-bearing tokens against stables should be ~1.0 to 1.15
-        let yield_tokens = ["sDAI", "sUSDS", "sUSDe", "scrvUSD", "sFRAX"];
-        let is_t0_yield = yield_tokens.contains(&t0);
-        let is_t1_yield = yield_tokens.contains(&t1);
-        
-        if (is_t0_yield && is_t1_stable) || (is_t1_yield && is_t0_stable) {
-            if price < 0.90 || price > 1.20 {
-                debug!("Filtered suspicious yield/stable pair: {} / {} price={:.4} @ {:?}",
-                    t0, t1, price, pool.address);
-                return false;
-            }
-        }
-        
-        // 7. Minimum liquidity check (if meaningful liquidity data exists)
-        // Skip pools with < $100 equivalent liquidity
-        let min_liquidity = 100 * 10u128.pow(18); // $100 in 18 decimals
-        if pool.liquidity > 0 && pool.liquidity < min_liquidity {
-            debug!("Filtered low liquidity pool: {:?}", pool.address);
+        // 8. Extreme price filter for remaining pools
+        if price > 1e15 || price < 1e-15 {
+            debug!("Filtered extreme price {} for {:?}", price, pool.address);
             return false;
         }
         
@@ -325,7 +419,15 @@ fn filter_suspicious_pools(pools: Vec<PoolState>) -> Vec<PoolState> {
     
     let removed = before_count - filtered.len();
     if removed > 0 {
-        info!("🧹 Filtered {} suspicious pools ({} remaining)", removed, filtered.len());
+        info!("🧹 Filtered {} suspicious pools, {} remaining", removed, filtered.len());
+    }
+    
+    // Debug: Show what made it through
+    debug!("Pools after filter:");
+    for pool in &filtered {
+        let t0 = symbol_map.get(&pool.token0).copied().unwrap_or("???");
+        let t1 = symbol_map.get(&pool.token1).copied().unwrap_or("???");
+        debug!("  {:?}: {}/{} price={:.6}", pool.address, t0, t1, pool.normalized_price());
     }
     
     filtered

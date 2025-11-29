@@ -472,106 +472,111 @@ impl PoolFetcher {
     }
 
     /// Fetch ALL pools using Multicall3 (main entry point)
-    pub async fn fetch_all_pools(&self) -> Result<Vec<PoolState>> {
-        let start = Instant::now();
-        let all_infos = get_all_known_pools();
-        
-        // Check cache for static data
+    /// Fetch ALL pools using Multicall3 (main entry point)
+pub async fn fetch_all_pools(&self) -> Result<Vec<PoolState>> {
+    let start = Instant::now();
+    let all_infos = get_all_known_pools();
+    
+    // Check cache for static data
+    let cache = POOL_CACHE.read().await;
+    let cached_count = cache.len();
+    drop(cache);
+    
+    // ============================================
+    // BATCH 1: Fetch static data for uncached pools
+    // ============================================
+    let uncached_infos: Vec<&PoolInfo> = {
         let cache = POOL_CACHE.read().await;
-        let cached_count = cache.len();
-        drop(cache);
+        all_infos.iter()
+            .filter(|info| {
+                let addr = Address::from_str(info.address).ok();
+                addr.map(|a| !cache.contains_key(&a)).unwrap_or(false)
+            })
+            .collect()
+    };
+    
+    if !uncached_infos.is_empty() {
+        debug!("Fetching static data for {} uncached pools", uncached_infos.len());
+        let new_cache_data = self.fetch_static_data_batch(&uncached_infos).await?;
         
-        // ============================================
-        // BATCH 1: Fetch static data for uncached pools
-        // ============================================
-        let uncached_infos: Vec<&PoolInfo> = {
-            let cache = POOL_CACHE.read().await;
-            all_infos.iter()
-                .filter(|info| {
-                    let addr = Address::from_str(info.address).ok();
-                    addr.map(|a| !cache.contains_key(&a)).unwrap_or(false)
-                })
-                .collect()
-        };
-        
-        if !uncached_infos.is_empty() {
-            debug!("Fetching static data for {} uncached pools", uncached_infos.len());
-            let new_cache_data = self.fetch_static_data_batch(&uncached_infos).await?;
-            
-            // Update cache
-            let mut cache = POOL_CACHE.write().await;
-            for (addr, data) in new_cache_data {
-                cache.insert(addr, data);
-            }
+        // Update cache
+        let mut cache = POOL_CACHE.write().await;
+        for (addr, data) in new_cache_data {
+            cache.insert(addr, data);
         }
-        
-        // ============================================
-        // BATCH 2: Fetch dynamic data for ALL pools
-        // ============================================
-        let dynamic_data = self.fetch_dynamic_data_batch(&all_infos).await?;
-        
-        // ============================================
-        // Combine static + dynamic data into PoolState
-        // ============================================
-        let cache = POOL_CACHE.read().await;
-        let mut pools = Vec::new();
-        let mut failed = 0;
-        
-        for dyn_data in dynamic_data {
-            if let Some(static_data) = cache.get(&dyn_data.address) {
-                // Find matching PoolInfo for DEX/type info
-                let pool_info = all_infos.iter()
-                    .find(|info| Address::from_str(info.address).ok() == Some(dyn_data.address));
-                
-                if let Some(info) = pool_info {
-                    let pool_state = PoolState {
-                        address: dyn_data.address,
-                        token0: static_data.token0,
-                        token1: static_data.token1,
-                        token0_decimals: static_data.token0_decimals,
-                        token1_decimals: static_data.token1_decimals,
-                        sqrt_price_x96: dyn_data.sqrt_price_x96,
-                        tick: dyn_data.tick,
-                        liquidity: dyn_data.liquidity,
-                        reserve1: dyn_data.reserve1,
-                        fee: static_data.fee,
-                        is_v4: false,
-                        dex: info.dex,
-                        pool_type: info.pool_type,
-                        weight0: (info.weight0.unwrap_or(0.5) * 1e18) as u128,
-                    };
-                    
-                    // Validate price
-                    let price = pool_state.normalized_price();
-                    if price > 0.0 && price < 1e12 {
-                        pools.push(pool_state);
-                    } else {
-                        failed += 1;
-                        trace!("Invalid price for pool {:?}: {}", dyn_data.address, price);
-                    }
-                }
-            } else {
-                failed += 1;
-            }
-        }
-        
-        let elapsed = start.elapsed();
-        let rpc_calls = if uncached_infos.is_empty() { 1 } else { 2 };
-        
-        info!(
-            "⚡ Multicall3: {} pools in {:?} ({} RPC calls, {} failed)",
-            pools.len(),
-            elapsed,
-            rpc_calls,
-            failed
-        );
-        
-        if pools.is_empty() {
-            return Err(eyre!("No valid pools fetched!"));
-        }
-        
-        Ok(pools)
     }
+    
+    // ============================================
+    // BATCH 2: Fetch dynamic data for ALL pools
+    // ============================================
+    let dynamic_data = self.fetch_dynamic_data_batch(&all_infos).await?;
+    
+    // ============================================
+    // Combine static + dynamic data into PoolState
+    // ============================================
+    let cache = POOL_CACHE.read().await;
+    let mut pools = Vec::new();
+    let mut failed = 0;
+    
+    debug!("Dynamic data has {} entries, cache has {} entries", dynamic_data.len(), cache.len());
+    
+    for dyn_data in dynamic_data {
+        if let Some(static_data) = cache.get(&dyn_data.address) {
+            // Find matching PoolInfo for DEX/type info
+            let pool_info = all_infos.iter()
+                .find(|info| Address::from_str(info.address).ok() == Some(dyn_data.address));
+            
+            if let Some(info) = pool_info {
+                let pool_state = PoolState {
+                    address: dyn_data.address,
+                    token0: static_data.token0,
+                    token1: static_data.token1,
+                    token0_decimals: static_data.token0_decimals,
+                    token1_decimals: static_data.token1_decimals,
+                    sqrt_price_x96: dyn_data.sqrt_price_x96,
+                    tick: dyn_data.tick,
+                    liquidity: dyn_data.liquidity,
+                    reserve1: dyn_data.reserve1,
+                    fee: static_data.fee,
+                    is_v4: false,
+                    dex: info.dex,
+                    pool_type: info.pool_type,
+                    weight0: (info.weight0.unwrap_or(0.5) * 1e18) as u128,
+                };
+                
+                // Validate price
+                let price = pool_state.normalized_price();
+                
+                if price > 0.0 && price < 1e12 {
+                    pools.push(pool_state);
+                } else {
+                    failed += 1;
+                    trace!("Invalid price {} for {:?}", price, dyn_data.address);
+                }
+            }
+        } else {
+            failed += 1;
+            debug!("No static data for {:?}", dyn_data.address);
+        }
+    }
+    
+    let elapsed = start.elapsed();
+    let rpc_calls = if uncached_infos.is_empty() { 1 } else { 2 };
+    
+    info!(
+        "⚡ Multicall3: {} pools in {:?} ({} RPC calls, {} failed)",
+        pools.len(),
+        elapsed,
+        rpc_calls,
+        failed
+    );
+    
+    if pools.is_empty() {
+        return Err(eyre!("No valid pools fetched!"));
+    }
+    
+    Ok(pools)
+}
 }
 
 /// Temporary struct for dynamic pool data

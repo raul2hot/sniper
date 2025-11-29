@@ -336,6 +336,21 @@ async fn run_scan(
     println!("DEBUG: Fetching all pools (this may take a while)...");
     let result = fetcher.fetch_all_pools().await?;
     println!("DEBUG: Fetched {} pools", result.pool_states.len());
+    let symbol_map = build_expanded_symbol_map();
+    // ADD THIS:
+    println!("DEBUG: Pool addresses:");
+    for p in &result.pool_states {
+        println!("  {:?} ({}/{})", p.address, 
+            symbol_map.get(&p.token0).unwrap_or(&"???"),
+            symbol_map.get(&p.token1).unwrap_or(&"???"));
+    }
+
+    // Check for USDC specifically
+    let usdc = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".parse::<Address>().unwrap();
+    let has_usdc = result.pool_states.iter().any(|p| p.token0 == usdc || p.token1 == usdc);
+    println!("DEBUG: USDC in pools? {}", has_usdc);
+    println!("DEBUG: get_all_known_pools has {} pools", cartographer::get_all_known_pools().len());
+    println!("DEBUG: Fetched {} pools", result.pool_states.len());
     let pools = result.pool_states;
     
     let eth_price = get_eth_price_from_pools(&pools);
