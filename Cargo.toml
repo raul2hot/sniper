@@ -113,6 +113,10 @@ path = "src/bin/generate_wallet.rs"
 name = "deploy-check"
 path = "src/bin/deploy_check.rs"
 
+[[bin]]
+name = "discover-pools"
+path = "src/bin/discover_pools.rs"
+
 [profile.release]
 # Optimize for speed in production
 opt-level = 3

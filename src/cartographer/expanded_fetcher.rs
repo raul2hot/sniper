@@ -1,0 +1,510 @@
+//! Expanded Pool Fetcher - Phase 4
+//!
+//! Integrates all pool sources:
+//! - Existing Uniswap V2/V3, SushiSwap, PancakeSwap, Balancer
+//! - NEW: Curve StableSwap NG (dynamic discovery)
+//! - NEW: Sky Ecosystem (sUSDS, USDS)
+//! - NEW: USD3/Reserve Protocol
+//!
+//! Safe extension - does NOT modify existing contracts or handlers.
+
+use alloy_primitives::{Address, U256, address};
+use alloy_provider::{Provider, ProviderBuilder};
+use alloy_sol_types::{sol, SolCall};
+use alloy_rpc_types::TransactionRequest;
+use eyre::{eyre, Result};
+use std::collections::HashMap;
+use std::time::Instant;
+use tracing::{debug, info, trace, warn};
+
+use super::{Dex, PoolState, PoolType, get_token_decimals};
+use super::curve_ng::{CurveNGFetcher, CurveNGPool};
+use super::sky_ecosystem::{SkyAdapter, ERC4626State, SUSDS_TOKEN, USDS_TOKEN, SDAI_TOKEN, DAI_TOKEN};
+use super::usd3_reserve::{USD3Adapter, USD3State, USD3_TOKEN};
+
+// ============================================
+// PRIORITY TOKENS (Phase 4)
+// ============================================
+
+/// Tokens to ALWAYS include in arbitrage search
+pub fn get_priority_tokens() -> Vec<(Address, &'static str, u8)> {
+    vec![
+        // Base tokens (existing)
+        (address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"), "WETH", 18),
+        (address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"), "USDC", 6),
+        (address!("dAC17F958D2ee523a2206206994597C13D831ec7"), "USDT", 6),
+        (address!("6B175474E89094C44Da98b954EedcdeCB5BE3830"), "DAI", 18),
+        (address!("2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599"), "WBTC", 8),
+        
+        // SKY Ecosystem (NEW - Phase 2)
+        (USDS_TOKEN, "USDS", 18),
+        (SUSDS_TOKEN, "sUSDS", 18),
+        (SDAI_TOKEN, "sDAI", 18),
+        
+        // USD3 (NEW - Phase 3)
+        (USD3_TOKEN, "USD3", 18),
+        
+        // Curve crvUSD
+        (address!("f939E0A03FB07F59A73314E73794Be0E57ac1b4E"), "crvUSD", 18),
+        
+        // FRAX ecosystem
+        (address!("853d955aCEf822Db058eb8505911ED77F175b99e"), "FRAX", 18),
+        (address!("3432B6A60D23Ca0dFCa7761B7ab56459D9C964D0"), "FXS", 18),
+        
+        // DOLA (Inverse Finance)
+        (address!("865377367054516e17014CcdED1e7d814EDC9ce4"), "DOLA", 18),
+        
+        // GHO (Aave)
+        (address!("40D16FC0246aD3160Ccc09B8D0D3A2cD28aE6C2f"), "GHO", 18),
+        
+        // pyUSD (PayPal)
+        (address!("6c3ea9036406852006290770BEdFcAbA0e23A0e8"), "pyUSD", 6),
+    ]
+}
+
+/// Build token symbol map including new tokens
+pub fn build_expanded_symbol_map() -> HashMap<Address, &'static str> {
+    let mut map = HashMap::new();
+    
+    for (addr, symbol, _) in get_priority_tokens() {
+        map.insert(addr, symbol);
+    }
+    
+    map
+}
+
+// ============================================
+// STATIC POOL DEFINITIONS (Phase 4 Priority)
+// ============================================
+
+/// New static pools to add for high-priority pairs
+pub fn get_new_priority_pools() -> Vec<NewPoolInfo> {
+    vec![
+        // ============================================
+        // SKY ECOSYSTEM POOLS
+        // ============================================
+        
+        // USDS/DAI - Sky migration pool (1:1 swap)
+        NewPoolInfo {
+            address: "0x... TODO: Discover from Curve NG",
+            token0: USDS_TOKEN,
+            token1: DAI_TOKEN,
+            token0_symbol: "USDS",
+            token1_symbol: "DAI",
+            fee: 1, // 0.01% - very low for 1:1 pairs
+            dex: Dex::Curve,
+            pool_type: PoolType::Curve,
+            note: "DAI migration - look for friction arb",
+        },
+        
+        // ============================================
+        // WSTETH/STETH POOLS (yield-bearing)
+        // ============================================
+        
+        // wstETH is already in existing pools but adding more
+        
+        // ============================================
+        // CRUVSD POOLS (pegkeeper dynamics)
+        // ============================================
+        
+        // crvUSD/USDT - high volume
+        NewPoolInfo {
+            address: "0x390f3595bCa2Df7d23783dFd126427CCeb997BF4",
+            token0: address!("f939E0A03FB07F59A73314E73794Be0E57ac1b4E"), // crvUSD
+            token1: address!("dAC17F958D2ee523a2206206994597C13D831ec7"), // USDT
+            token0_symbol: "crvUSD",
+            token1_symbol: "USDT",
+            fee: 4, // 0.04%
+            dex: Dex::Curve,
+            pool_type: PoolType::Curve,
+            note: "Pegkeeper dynamics create spreads",
+        },
+        
+        // crvUSD/USDC
+        NewPoolInfo {
+            address: "0x4DEcE678ceceb27446b35C672dC7d61F30bAD69E",
+            token0: address!("f939E0A03FB07F59A73314E73794Be0E57ac1b4E"), // crvUSD
+            token1: address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"), // USDC
+            token0_symbol: "crvUSD",
+            token1_symbol: "USDC",
+            fee: 4,
+            dex: Dex::Curve,
+            pool_type: PoolType::Curve,
+            note: "High volume crvUSD pool",
+        },
+        
+        // ============================================
+        // FRAX ECOSYSTEM
+        // ============================================
+        
+        // FRAX/USDC - algorithmic stablecoin
+        NewPoolInfo {
+            address: "0xDcEF968d416a41Cdac0ED8702fAC8128A64241A2",
+            token0: address!("853d955aCEf822Db058eb8505911ED77F175b99e"), // FRAX
+            token1: address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"), // USDC
+            token0_symbol: "FRAX",
+            token1_symbol: "USDC",
+            fee: 4,
+            dex: Dex::Curve,
+            pool_type: PoolType::Curve,
+            note: "FRAX peg maintenance creates opportunities",
+        },
+        
+        // ============================================
+        // GHO POOLS (Aave stablecoin)
+        // ============================================
+        
+        // GHO/USDT
+        NewPoolInfo {
+            address: "0x...", // TODO: Look up from Curve factory
+            token0: address!("40D16FC0246aD3160Ccc09B8D0D3A2cD28aE6C2f"), // GHO
+            token1: address!("dAC17F958D2ee523a2206206994597C13D831ec7"), // USDT
+            token0_symbol: "GHO",
+            token1_symbol: "USDT",
+            fee: 4,
+            dex: Dex::Curve,
+            pool_type: PoolType::Curve,
+            note: "GHO discount/premium creates arb",
+        },
+        
+        // ============================================
+        // DOLA POOLS (Inverse Finance)
+        // ============================================
+        
+        // DOLA/USDC
+        NewPoolInfo {
+            address: "0xAA5A67c256e27A5d80712c51971408db3370927D",
+            token0: address!("865377367054516e17014CcdED1e7d814EDC9ce4"), // DOLA
+            token1: address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"), // USDC
+            token0_symbol: "DOLA",
+            token1_symbol: "USDC",
+            fee: 4,
+            dex: Dex::Curve,
+            pool_type: PoolType::Curve,
+            note: "Leverage demand creates spreads",
+        },
+    ]
+}
+
+/// New pool info for static definition
+#[derive(Debug, Clone)]
+pub struct NewPoolInfo {
+    pub address: &'static str,
+    pub token0: Address,
+    pub token1: Address,
+    pub token0_symbol: &'static str,
+    pub token1_symbol: &'static str,
+    pub fee: u32,
+    pub dex: Dex,
+    pub pool_type: PoolType,
+    pub note: &'static str,
+}
+
+// ============================================
+// EXPANDED POOL FETCHER
+// ============================================
+
+/// Expanded fetcher that combines all pool sources
+pub struct ExpandedPoolFetcher {
+    rpc_url: String,
+    curve_ng_fetcher: CurveNGFetcher,
+    sky_adapter: SkyAdapter,
+    usd3_adapter: USD3Adapter,
+}
+
+impl ExpandedPoolFetcher {
+    pub fn new(rpc_url: String) -> Self {
+        Self {
+            curve_ng_fetcher: CurveNGFetcher::new(rpc_url.clone()),
+            sky_adapter: SkyAdapter::new(rpc_url.clone()),
+            usd3_adapter: USD3Adapter::new(rpc_url.clone()),
+            rpc_url,
+        }
+    }
+    
+    /// Fetch ALL pools including new sources
+    pub async fn fetch_all_pools(&self) -> Result<ExpandedPoolResult> {
+        let start = Instant::now();
+        
+        let mut result = ExpandedPoolResult::default();
+        
+        // 1. Fetch existing pools (from original fetcher)
+        info!("📦 Fetching existing pools...");
+        let existing_pools = self.fetch_existing_pools().await?;
+        result.existing_pools = existing_pools.len();
+        result.pool_states.extend(existing_pools);
+        
+        // 2. Discover Curve NG pools
+        info!("🔍 Discovering Curve NG pools...");
+        // match self.curve_ng_fetcher.discover_all_ng_pools().await {
+        //     Ok(ng_pools) => {
+        //         let states = self.curve_ng_fetcher.convert_to_pool_states(&ng_pools);
+        //         result.curve_ng_pools = ng_pools.len();
+        //         result.curve_ng_states = states.len();
+        //         result.pool_states.extend(states);
+        //         result.ng_pool_details = ng_pools;
+        //     }
+        //     Err(e) => {
+        //         warn!("Failed to discover Curve NG pools: {}", e);
+        //     }
+        // }
+        
+        // 3. Fetch Sky ecosystem state
+        info!("🌤️ Fetching Sky ecosystem state...");
+        match self.sky_adapter.fetch_all_vaults().await {
+            Ok(vaults) => {
+                result.erc4626_vaults = vaults.clone();
+                
+                // Create virtual pools for ERC-4626 deposit/redeem
+                for vault in &vaults {
+                    let virtual_pools = super::sky_ecosystem::create_erc4626_virtual_pools(vault);
+                    // Convert virtual pools to PoolState edges
+                    for vp in virtual_pools {
+                        if let Some(state) = self.virtual_pool_to_state(&vp, vault) {
+                            result.pool_states.push(state);
+                            result.virtual_erc4626_edges += 1;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Failed to fetch Sky ecosystem: {}", e);
+            }
+        }
+        
+        // 4. Fetch USD3 state
+        info!("💵 Fetching USD3 NAV...");
+        match self.usd3_adapter.fetch_usd3_state().await {
+            Ok(state) => {
+                result.usd3_state = Some(state);
+            }
+            Err(e) => {
+                warn!("Failed to fetch USD3 state: {}", e);
+            }
+        }
+        
+        result.fetch_duration = start.elapsed();
+        
+        info!(
+            "✅ Expanded fetch complete: {} pools ({} existing, {} NG, {} virtual) in {:?}",
+            result.pool_states.len(),
+            result.existing_pools,
+            result.curve_ng_states,
+            result.virtual_erc4626_edges,
+            result.fetch_duration
+        );
+        
+        Ok(result)
+    }
+    
+    /// Fetch existing pools (calls the original fetcher logic)
+    async fn fetch_existing_pools(&self) -> Result<Vec<PoolState>> {
+        // Import and use the original pool fetcher
+        let fetcher = super::PoolFetcher::new(self.rpc_url.clone());
+        fetcher.fetch_all_pools().await
+    }
+    
+    /// Convert virtual ERC-4626 pool to PoolState
+    fn virtual_pool_to_state(
+        &self,
+        vp: &super::sky_ecosystem::VirtualERC4626Pool,
+        vault_state: &ERC4626State,
+    ) -> Option<PoolState> {
+        use super::sky_ecosystem::ERC4626Direction;
+        
+        let (token0, token1) = match vp.direction {
+            ERC4626Direction::Deposit => (vp.underlying, vp.vault),  // underlying -> shares
+            ERC4626Direction::Redeem => (vp.vault, vp.underlying),   // shares -> underlying
+        };
+        
+        let d0 = get_token_decimals(&token0);
+        let d1 = get_token_decimals(&token1);
+        
+        // Calculate price from rate
+        let rate_f64 = vp.rate.to::<u128>() as f64 / 1e18;
+        if rate_f64 <= 0.0 || !rate_f64.is_finite() {
+            return None;
+        }
+        
+        let sqrt_price = rate_f64.sqrt() * 2_f64.powi(96);
+        
+        // Virtual pool for ERC-4626 - very low "fee" since deposit/redeem is feeless
+        Some(PoolState {
+            address: vp.vault, // Use vault address as pool address
+            token0,
+            token1,
+            token0_decimals: d0,
+            token1_decimals: d1,
+            sqrt_price_x96: U256::from(sqrt_price as u128),
+            tick: 0,
+            liquidity: vault_state.total_assets.to::<u128>(),
+            reserve1: vault_state.total_supply.to::<u128>(),
+            fee: 1, // Minimal fee for deposit/redeem (gas only)
+            is_v4: false,
+            dex: Dex::BalancerV2, // Reuse BalancerV2 type for ERC-4626 vaults
+            pool_type: PoolType::Balancer, // Custom type would be better
+            weight0: 5 * 10u128.pow(17), // 0.5
+        })
+    }
+    
+    /// Get expanded token symbol map
+    pub fn get_symbol_map(&self) -> HashMap<Address, &'static str> {
+        build_expanded_symbol_map()
+    }
+}
+
+/// Result of expanded pool fetch
+#[derive(Debug, Default)]
+pub struct ExpandedPoolResult {
+    /// All pool states for graph construction
+    pub pool_states: Vec<PoolState>,
+    
+    /// Count of existing (original) pools
+    pub existing_pools: usize,
+    
+    /// Count of discovered Curve NG pools
+    pub curve_ng_pools: usize,
+    
+    /// Count of pool states from Curve NG
+    pub curve_ng_states: usize,
+    
+    /// Count of virtual ERC-4626 edges
+    pub virtual_erc4626_edges: usize,
+    
+    /// Detailed Curve NG pool info
+    pub ng_pool_details: Vec<CurveNGPool>,
+    
+    /// ERC-4626 vault states
+    pub erc4626_vaults: Vec<ERC4626State>,
+    
+    /// USD3 state (optional)
+    pub usd3_state: Option<USD3State>,
+    
+    /// Time to fetch
+    pub fetch_duration: std::time::Duration,
+}
+
+impl ExpandedPoolResult {
+    /// Total number of pools/edges
+    pub fn total_pools(&self) -> usize {
+        self.pool_states.len()
+    }
+    
+    /// Summary string
+    pub fn summary(&self) -> String {
+        format!(
+            "{} pools: {} existing + {} NG + {} virtual ({:?})",
+            self.total_pools(),
+            self.existing_pools,
+            self.curve_ng_states,
+            self.virtual_erc4626_edges,
+            self.fetch_duration
+        )
+    }
+}
+
+// ============================================
+// HELPER: Detect opportunities across new pools
+// ============================================
+
+/// Check for special arbitrage opportunities unique to new pools
+pub async fn check_special_opportunities(
+    result: &ExpandedPoolResult,
+    min_profit_bps: f64,
+) -> Vec<SpecialOpportunity> {
+    let mut opportunities = Vec::new();
+    
+    // 1. Check ERC-4626 yield drift
+    for vault in &result.erc4626_vaults {
+        if let Some(arb) = vault.check_arb_opportunity(min_profit_bps) {
+            opportunities.push(SpecialOpportunity::YieldDrift {
+                vault: vault.vault_address,
+                symbol: vault.symbol.clone(),
+                spread_pct: arb.spread_pct,
+            });
+        }
+    }
+    
+    // 2. Check USD3 NAV arbitrage
+    if let Some(ref usd3) = result.usd3_state {
+        if let Some(arb) = usd3.check_nav_arb(min_profit_bps) {
+            opportunities.push(SpecialOpportunity::NAVArb {
+                token: USD3_TOKEN,
+                symbol: "USD3".to_string(),
+                spread_pct: arb.spread_pct,
+            });
+        }
+    }
+    
+    // 3. Check Curve NG pools with high imbalance (higher fees = opportunity)
+    for ng_pool in &result.ng_pool_details {
+        if ng_pool.has_erc4626 {
+            // Pools with ERC-4626 tokens may have yield drift
+            let effective_fee = ng_pool.effective_fee(0, 1);
+            if effective_fee > ng_pool.base_fee * 2 {
+                // Pool is significantly imbalanced
+                opportunities.push(SpecialOpportunity::ImbalancedPool {
+                    pool: ng_pool.address,
+                    base_fee: ng_pool.base_fee,
+                    effective_fee,
+                });
+            }
+        }
+    }
+    
+    opportunities
+}
+
+/// Special opportunity types unique to new pools
+#[derive(Debug, Clone)]
+pub enum SpecialOpportunity {
+    /// ERC-4626 vault trading away from redemption value
+    YieldDrift {
+        vault: Address,
+        symbol: String,
+        spread_pct: f64,
+    },
+    
+    /// Basket-backed token trading away from NAV
+    NAVArb {
+        token: Address,
+        symbol: String,
+        spread_pct: f64,
+    },
+    
+    /// Curve NG pool with high imbalance (elevated fees)
+    ImbalancedPool {
+        pool: Address,
+        base_fee: u32,
+        effective_fee: u32,
+    },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_priority_tokens() {
+        let tokens = get_priority_tokens();
+        assert!(tokens.len() >= 10);
+        
+        // Check USDS is included
+        assert!(tokens.iter().any(|(addr, _, _)| *addr == USDS_TOKEN));
+        
+        // Check sUSDS is included
+        assert!(tokens.iter().any(|(addr, _, _)| *addr == SUSDS_TOKEN));
+        
+        // Check USD3 is included
+        assert!(tokens.iter().any(|(addr, _, _)| *addr == USD3_TOKEN));
+    }
+    
+    #[test]
+    fn test_symbol_map() {
+        let map = build_expanded_symbol_map();
+        
+        assert_eq!(map.get(&USDS_TOKEN), Some(&"USDS"));
+        assert_eq!(map.get(&SUSDS_TOKEN), Some(&"sUSDS"));
+        assert_eq!(map.get(&USD3_TOKEN), Some(&"USD3"));
+    }
+}

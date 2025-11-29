@@ -21,7 +21,7 @@ mod executor;
 mod gas_oracle;
 
 use brain::{BoundedBellmanFord, ProfitFilter, ArbitrageCycle};
-use cartographer::{ArbitrageGraph, PoolFetcher, Dex};
+use cartographer::{ArbitrageGraph, ExpandedPoolFetcher, Dex};
 use config::{Config, ExecutionMode};
 use simulator::SwapSimulator;
 use executor::ExecutionEngine;
@@ -204,6 +204,7 @@ async fn main() -> Result<()> {
     println!("└─────────────────────────────────────────────────────────┘");
     println!();
     println!("Starting continuous scan loop...");
+    println!("DEBUG: About to start first scan...");
     println!();
 
     loop {
@@ -320,9 +321,10 @@ async fn run_scan(
     stats: &mut Stats,
 ) -> Result<ScanResult> {
     stats.total_scans += 1;
+    println!("DEBUG: Scan #{} - fetching gas price...", stats.total_scans);
     
-    // Get real-time gas price FIRST
     let gas_info = gas_oracle.get_gas_price().await;
+    println!("DEBUG: Gas price fetched: {:.2} gwei", gas_info.gas_price_gwei);
     let gas_gwei = gas_info.gas_price_gwei;
     
     // Update stats
@@ -344,24 +346,42 @@ async fn run_scan(
     }
     
     // Fetch pools
-    let fetcher = PoolFetcher::new(config.rpc_url.clone());
-    let pools = fetcher.fetch_all_pools().await?;
+    println!("DEBUG: About to fetch pools...");
+    let fetcher = ExpandedPoolFetcher::new(config.rpc_url.clone());
+    println!("DEBUG: Fetching all pools (this may take a while)...");
+    let result = fetcher.fetch_all_pools().await?;
+    println!("DEBUG: Fetched {} pools", result.pool_states.len());
+    let pools = result.pool_states;
+    
     let eth_price = get_eth_price_from_pools(&pools);
     stats.last_eth_price = eth_price;
 
     // Build graph
     let graph = ArbitrageGraph::from_pools(&pools);
-    
+    println!("DEBUG: Graph has {} nodes, {} edges", graph.node_count(), graph.edge_count());
     // Find cycles
     let bellman_ford = BoundedBellmanFord::new(&graph, config.max_hops);
     let base_tokens = config.base_token_addresses();
-    let cycles: Vec<_> = bellman_ford.find_all_cycles(&base_tokens)
+    // Add expanded base tokens for cycle search
+    let mut expanded_bases = base_tokens.clone();
+    // Add USDS, sUSDS, crvUSD as cycle starting points
+    if let Ok(addr) = "0xdC035D45d973E3EC169d2276DDab16f1e407384F".parse() {
+        expanded_bases.push(addr); // USDS
+    }
+    if let Ok(addr) = "0xa3931d71877C0E7a3148CB7Eb4463524FEc27fbD".parse() {
+        expanded_bases.push(addr); // sUSDS  
+    }
+    if let Ok(addr) = "0xf939E0A03FB07F59A73314E73794Be0E57ac1b4E".parse() {
+        expanded_bases.push(addr); // crvUSD
+    }
+    let cycles: Vec<_> = bellman_ford.find_all_cycles(&expanded_bases)
         .into_iter()
         .filter(|c| !config.is_cycle_blacklisted(&c.path))
         .collect();
 
     let cycles_found = cycles.len();
     stats.total_cycles += cycles_found as u64;
+    println!("DEBUG: Found {} raw cycles", cycles_found);
 
     if cycles.is_empty() {
         return Ok(ScanResult {
@@ -379,11 +399,18 @@ async fn run_scan(
     // Sort by expected return and take top candidates
     let mut sorted = cycles;
     sorted.sort_by(|a, b| b.expected_return.partial_cmp(&a.expected_return).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Show top 3 expected returns before filtering
+    for (i, c) in sorted.iter().take(3).enumerate() {
+        println!("DEBUG: Cycle {} expected_return: {:.6}", i, c.expected_return);
+    }
     
     let candidates: Vec<_> = sorted.into_iter()
         .filter(|c| c.expected_return > 1.0001)
         .take(5)
         .collect();
+
+    println!("DEBUG: {} candidates after filter (expected_return > 1.0001)", candidates.len());
 
     if candidates.is_empty() {
         return Ok(ScanResult {
@@ -397,7 +424,20 @@ async fn run_scan(
             eth_price,
         });
     }
-
+    // let specials = check_special_opportunities(&result, 50.0).await;
+    // for opp in specials {
+    //     match opp {
+    //         SpecialOpportunity::YieldDrift { symbol, spread_pct, .. } => {
+    //             info!("🎯 Yield drift: {} spread={:.2}%", symbol, spread_pct);
+    //         }
+    //         SpecialOpportunity::NAVArb { symbol, spread_pct, .. } => {
+    //             info!("🎯 NAV arb: {} spread={:.2}%", symbol, spread_pct);
+    //         }
+    //         SpecialOpportunity::ImbalancedPool { base_fee, effective_fee, .. } => {
+    //             info!("🎯 Imbalanced pool: fee {} -> {}", base_fee, effective_fee);
+    //         }
+    //     }
+    // }
     // Create simulator with REAL gas price
     let swap_sim = SwapSimulator::new(&config.rpc_url).await?;
     // Note: We calculate gas cost separately using gas_info for accuracy
