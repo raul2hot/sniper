@@ -246,12 +246,13 @@ pub fn build_expanded_symbol_map() -> HashMap<Address, &'static str> {
 // ============================================
 
 /// New static pools to add for high-priority pairs
+/// FIXED: Now includes token decimals for proper price calculation
 pub fn get_new_priority_pools() -> Vec<NewPoolInfo> {
     vec![
         // ============================================
         // SKY ECOSYSTEM POOLS
         // ============================================
-        
+
         // USDS/DAI - Sky migration pool (1:1 swap)
         NewPoolInfo {
             address: "0x3225737a9Bbb6473CB4a45b7244ACa2BeFdB276A", // DAI_USDS_CONVERTER
@@ -259,22 +260,24 @@ pub fn get_new_priority_pools() -> Vec<NewPoolInfo> {
             token1: DAI_TOKEN,
             token0_symbol: "USDS",
             token1_symbol: "DAI",
+            token0_decimals: 18,  // USDS = 18 decimals
+            token1_decimals: 18,  // DAI = 18 decimals
             fee: 1,
             dex: Dex::Curve,
             pool_type: PoolType::Curve,
             note: "DAI-USDS 1:1 migration bridge",
         },
-        
+
         // ============================================
         // WSTETH/STETH POOLS (yield-bearing)
         // ============================================
-        
+
         // wstETH is already in existing pools but adding more
-        
+
         // ============================================
         // CRUVSD POOLS (pegkeeper dynamics)
         // ============================================
-        
+
         // crvUSD/USDT - high volume
         NewPoolInfo {
             address: "0x390f3595bCa2Df7d23783dFd126427CCeb997BF4",
@@ -282,12 +285,14 @@ pub fn get_new_priority_pools() -> Vec<NewPoolInfo> {
             token1: address!("dAC17F958D2ee523a2206206994597C13D831ec7"), // USDT
             token0_symbol: "crvUSD",
             token1_symbol: "USDT",
+            token0_decimals: 18,  // crvUSD = 18 decimals
+            token1_decimals: 6,   // USDT = 6 decimals
             fee: 4, // 0.04%
             dex: Dex::Curve,
             pool_type: PoolType::Curve,
             note: "Pegkeeper dynamics create spreads",
         },
-        
+
         // crvUSD/USDC
         NewPoolInfo {
             address: "0x4DEcE678ceceb27446b35C672dC7d61F30bAD69E",
@@ -295,16 +300,18 @@ pub fn get_new_priority_pools() -> Vec<NewPoolInfo> {
             token1: address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"), // USDC
             token0_symbol: "crvUSD",
             token1_symbol: "USDC",
+            token0_decimals: 18,  // crvUSD = 18 decimals
+            token1_decimals: 6,   // USDC = 6 decimals
             fee: 4,
             dex: Dex::Curve,
             pool_type: PoolType::Curve,
             note: "High volume crvUSD pool",
         },
-        
+
         // ============================================
         // FRAX ECOSYSTEM
         // ============================================
-        
+
         // FRAX/USDC - algorithmic stablecoin
         NewPoolInfo {
             address: "0xDcEF968d416a41Cdac0ED8702fAC8128A64241A2",
@@ -312,16 +319,18 @@ pub fn get_new_priority_pools() -> Vec<NewPoolInfo> {
             token1: address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"), // USDC
             token0_symbol: "FRAX",
             token1_symbol: "USDC",
+            token0_decimals: 18,  // FRAX = 18 decimals
+            token1_decimals: 6,   // USDC = 6 decimals
             fee: 4,
             dex: Dex::Curve,
             pool_type: PoolType::Curve,
             note: "FRAX peg maintenance creates opportunities",
         },
-        
+
         // ============================================
         // GHO POOLS (Aave stablecoin)
         // ============================================
-        
+
         // GHO/USDT
         NewPoolInfo {
             address: "0x...", // TODO: Look up from Curve factory
@@ -329,16 +338,18 @@ pub fn get_new_priority_pools() -> Vec<NewPoolInfo> {
             token1: address!("dAC17F958D2ee523a2206206994597C13D831ec7"), // USDT
             token0_symbol: "GHO",
             token1_symbol: "USDT",
+            token0_decimals: 18,  // GHO = 18 decimals
+            token1_decimals: 6,   // USDT = 6 decimals
             fee: 4,
             dex: Dex::Curve,
             pool_type: PoolType::Curve,
             note: "GHO discount/premium creates arb",
         },
-        
+
         // ============================================
         // DOLA POOLS (Inverse Finance)
         // ============================================
-        
+
         // DOLA/USDC
         NewPoolInfo {
             address: "0xAA5A67c256e27A5d80712c51971408db3370927D",
@@ -346,6 +357,8 @@ pub fn get_new_priority_pools() -> Vec<NewPoolInfo> {
             token1: address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"), // USDC
             token0_symbol: "DOLA",
             token1_symbol: "USDC",
+            token0_decimals: 18,  // DOLA = 18 decimals
+            token1_decimals: 6,   // USDC = 6 decimals
             fee: 4,
             dex: Dex::Curve,
             pool_type: PoolType::Curve,
@@ -354,7 +367,7 @@ pub fn get_new_priority_pools() -> Vec<NewPoolInfo> {
     ]
 }
 
-/// New pool info for static definition
+/// New pool info for static definition - WITH DECIMALS for proper pricing
 #[derive(Debug, Clone)]
 pub struct NewPoolInfo {
     pub address: &'static str,
@@ -362,6 +375,8 @@ pub struct NewPoolInfo {
     pub token1: Address,
     pub token0_symbol: &'static str,
     pub token1_symbol: &'static str,
+    pub token0_decimals: u8,  // FIXED: Added for proper decimal handling
+    pub token1_decimals: u8,  // FIXED: Added for proper decimal handling
     pub fee: u32,
     pub dex: Dex,
     pub pool_type: PoolType,
@@ -814,6 +829,7 @@ impl ExpandedPoolFetcher {
     
     /// Add bridging pools WITH actual on-chain prices (BATCHED)
     /// Uses Multicall3 to fetch all prices in a single RPC call
+    /// FIXED: Now properly handles token decimals to avoid price distortion
     async fn add_bridging_pools(&self, pool_states: &mut Vec<PoolState>) -> usize {
         // Collect valid pools and build batch request
         let priority_pools = get_new_priority_pools();
@@ -832,60 +848,166 @@ impl ExpandedPoolFetcher {
             return 0;
         }
 
-        // Build batch request for all prices
-        let dx = U256::from(10u64.pow(18));
-        let requests: Vec<(Address, i128, i128, U256)> = valid_pools.iter()
-            .map(|(addr, _)| (*addr, 0i128, 1i128, dx))
+        // FIX: Build batch request with CORRECT decimals for each token
+        // Use $10,000 worth as base amount for better precision
+        let base_amount_usd = 10000.0;
+        let forward_requests: Vec<(Address, i128, i128, U256)> = valid_pools.iter()
+            .map(|(addr, info)| {
+                // FIXED: Use token0's actual decimals for the input amount
+                let dx = U256::from((base_amount_usd * 10_f64.powi(info.token0_decimals as i32)) as u128);
+                (*addr, 0i128, 1i128, dx)
+            })
             .collect();
 
-        // Batch fetch all prices in 1 RPC call
-        let prices = match self.curve_ng_fetcher.batch_get_dy(&requests).await {
+        // Batch fetch forward prices (token0 -> token1)
+        let forward_prices = match self.curve_ng_fetcher.batch_get_dy(&forward_requests).await {
             Ok(results) => results,
             Err(e) => {
-                warn!("Batch price fetch failed: {}, using fallback 1.0 for all", e);
-                vec![None; valid_pools.len()]
+                warn!("Batch forward price fetch failed: {}, skipping bridging pools", e);
+                return 0;
             }
         };
 
-        // Create pool states with fetched prices
+        // FIX: Also fetch reverse prices (token1 -> token0) for bidirectional edges
+        let reverse_requests: Vec<(Address, i128, i128, U256)> = valid_pools.iter()
+            .map(|(addr, info)| {
+                // Use token1's decimals for the reverse direction
+                let dx = U256::from((base_amount_usd * 10_f64.powi(info.token1_decimals as i32)) as u128);
+                (*addr, 1i128, 0i128, dx)  // Reversed: i=1, j=0
+            })
+            .collect();
+
+        let reverse_prices = self.curve_ng_fetcher.batch_get_dy(&reverse_requests).await
+            .unwrap_or_else(|_| vec![None; valid_pools.len()]);
+
+        // Create pool states with fetched prices - WITH DECIMAL NORMALIZATION
         let mut count = 0;
-        for ((pool_address, pool_info), price_result) in valid_pools.iter().zip(prices.iter()) {
-            let price = match price_result {
-                Some(dy) => {
-                    let p = dy.to::<u128>() as f64 / dx.to::<u128>() as f64;
-                    if p > 0.0 && p.is_finite() { p } else { 1.0 }
+        for (idx, ((pool_address, pool_info), fwd_price)) in valid_pools.iter().zip(forward_prices.iter()).enumerate() {
+            // === FORWARD DIRECTION: token0 -> token1 ===
+            if let Some(dy) = fwd_price {
+                let (_, _, _, dx) = forward_requests[idx];
+
+                // FIX: Normalize by decimals to get proper price
+                let dx_normalized = dx.to::<u128>() as f64 / 10_f64.powi(pool_info.token0_decimals as i32);
+                let dy_normalized = dy.to::<u128>() as f64 / 10_f64.powi(pool_info.token1_decimals as i32);
+
+                if dx_normalized > 0.0 {
+                    let price = dy_normalized / dx_normalized;
+
+                    debug!(
+                        "Pool {:?} ({}/{}): dx_norm={:.2}, dy_norm={:.2}, price={:.6}",
+                        pool_address, pool_info.token0_symbol, pool_info.token1_symbol,
+                        dx_normalized, dy_normalized, price
+                    );
+
+                    // FIX: Validate stablecoin prices are sane
+                    let is_stablecoin_pair =
+                        pool_info.token0_symbol.contains("USD") || pool_info.token0_symbol.contains("DAI") ||
+                        pool_info.token0_symbol.contains("FRAX") || pool_info.token0_symbol.contains("DOLA") ||
+                        pool_info.token0_symbol.contains("GHO");
+
+                    if is_stablecoin_pair {
+                        // Both are stablecoins - price should be 0.8 - 1.25
+                        if price < 0.8 || price > 1.25 {
+                            warn!(
+                                "Suspicious stablecoin price {:.4} for {} -> {}, skipping",
+                                price, pool_info.token0_symbol, pool_info.token1_symbol
+                            );
+                            continue;
+                        }
+                    }
+
+                    if price > 0.0 && price.is_finite() {
+                        // Convert normalized price to sqrt_price_x96 format
+                        let sqrt_price = price.sqrt() * 2_f64.powi(96);
+
+                        let state = PoolState {
+                            address: *pool_address,
+                            token0: pool_info.token0,
+                            token1: pool_info.token1,
+                            token0_decimals: pool_info.token0_decimals,
+                            token1_decimals: pool_info.token1_decimals,
+                            sqrt_price_x96: U256::from(sqrt_price as u128),
+                            tick: 0,
+                            liquidity: 10u128.pow(24),  // Placeholder
+                            reserve1: 10u128.pow(24),   // Placeholder
+                            fee: pool_info.fee,
+                            is_v4: false,
+                            dex: pool_info.dex,
+                            pool_type: pool_info.pool_type,
+                            weight0: 5 * 10u128.pow(17),
+                        };
+
+                        pool_states.push(state);
+                        count += 1;
+                    }
                 }
-                None => {
-                    warn!("Could not fetch price for {:?}, using 1.0", pool_address);
-                    1.0
+            } else {
+                warn!("Could not fetch forward price for {:?}, skipping", pool_address);
+            }
+
+            // === REVERSE DIRECTION: token1 -> token0 ===
+            if let Some(dy) = &reverse_prices[idx] {
+                let (_, _, _, dx) = reverse_requests[idx];
+
+                // FIX: Normalize by decimals (swapped for reverse direction)
+                let dx_normalized = dx.to::<u128>() as f64 / 10_f64.powi(pool_info.token1_decimals as i32);
+                let dy_normalized = dy.to::<u128>() as f64 / 10_f64.powi(pool_info.token0_decimals as i32);
+
+                if dx_normalized > 0.0 {
+                    let price = dy_normalized / dx_normalized;
+
+                    debug!(
+                        "Pool {:?} ({}/{}): REVERSE dx_norm={:.2}, dy_norm={:.2}, price={:.6}",
+                        pool_address, pool_info.token1_symbol, pool_info.token0_symbol,
+                        dx_normalized, dy_normalized, price
+                    );
+
+                    // FIX: Validate stablecoin prices are sane
+                    let is_stablecoin_pair =
+                        pool_info.token1_symbol.contains("USD") || pool_info.token1_symbol.contains("DAI") ||
+                        pool_info.token1_symbol.contains("FRAX") || pool_info.token1_symbol.contains("DOLA") ||
+                        pool_info.token1_symbol.contains("GHO");
+
+                    if is_stablecoin_pair {
+                        if price < 0.8 || price > 1.25 {
+                            warn!(
+                                "Suspicious stablecoin reverse price {:.4} for {} -> {}, skipping",
+                                price, pool_info.token1_symbol, pool_info.token0_symbol
+                            );
+                            continue;
+                        }
+                    }
+
+                    if price > 0.0 && price.is_finite() {
+                        let sqrt_price = price.sqrt() * 2_f64.powi(96);
+
+                        // Create reverse edge (swap token0/token1)
+                        let reverse_state = PoolState {
+                            address: *pool_address,
+                            token0: pool_info.token1,       // SWAPPED
+                            token1: pool_info.token0,       // SWAPPED
+                            token0_decimals: pool_info.token1_decimals,  // SWAPPED
+                            token1_decimals: pool_info.token0_decimals,  // SWAPPED
+                            sqrt_price_x96: U256::from(sqrt_price as u128),
+                            tick: 0,
+                            liquidity: 10u128.pow(24),
+                            reserve1: 10u128.pow(24),
+                            fee: pool_info.fee,
+                            is_v4: false,
+                            dex: pool_info.dex,
+                            pool_type: pool_info.pool_type,
+                            weight0: 5 * 10u128.pow(17),
+                        };
+
+                        pool_states.push(reverse_state);
+                        count += 1;
+                    }
                 }
-            };
-
-            let d0 = get_token_decimals(&pool_info.token0);
-            let d1 = get_token_decimals(&pool_info.token1);
-            let sqrt_price = price.sqrt() * 2_f64.powi(96) * 10_f64.powi((d1 as i32 - d0 as i32) / 2);
-
-            let state = PoolState {
-                address: *pool_address,
-                token0: pool_info.token0,
-                token1: pool_info.token1,
-                token0_decimals: d0,
-                token1_decimals: d1,
-                sqrt_price_x96: U256::from(sqrt_price as u128),
-                tick: 0,
-                liquidity: 10u128.pow(24),
-                reserve1: 10u128.pow(24),
-                fee: pool_info.fee,
-                is_v4: false,
-                dex: pool_info.dex,
-                pool_type: pool_info.pool_type,
-                weight0: 5 * 10u128.pow(17),
-            };
-
-            pool_states.push(state);
-            count += 1;
+            }
         }
 
+        info!("Added {} bridging pool edges (forward + reverse) with accurate decimal-normalized prices", count);
         count
     }
     /// Convert virtual ERC-4626 pool to PoolState
