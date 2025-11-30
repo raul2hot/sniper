@@ -256,39 +256,14 @@ pub fn build_expanded_symbol_map() -> HashMap<Address, &'static str> {
 // ============================================
 
 /// New static pools to add for high-priority pairs
-/// FIXED: Now includes token decimals for proper price calculation
+/// FIXED V3: Removed non-standard pools that don't support coins() interface
 pub fn get_new_priority_pools() -> Vec<NewPoolInfo> {
     vec![
-        // ============================================
-        // SKY ECOSYSTEM POOLS
-        // ============================================
-
-        // USDS/DAI - Sky migration pool (1:1 swap)
-        NewPoolInfo {
-            address: "0x3225737a9Bbb6473CB4a45b7244ACa2BeFdB276A", // DAI_USDS_CONVERTER
-            token0: USDS_TOKEN,
-            token1: DAI_TOKEN,
-            token0_symbol: "USDS",
-            token1_symbol: "DAI",
-            token0_decimals: 18,  // USDS = 18 decimals
-            token1_decimals: 18,  // DAI = 18 decimals
-            fee: 1,
-            dex: Dex::Curve,
-            pool_type: PoolType::Curve,
-            note: "DAI-USDS 1:1 migration bridge",
-        },
-
-        // ============================================
-        // WSTETH/STETH POOLS (yield-bearing)
-        // ============================================
-
-        // wstETH is already in existing pools but adding more
-
         // ============================================
         // CRUVSD POOLS (pegkeeper dynamics)
         // ============================================
 
-        // crvUSD/USDT - high volume
+        // crvUSD/USDT - high volume, standard 2-coin pool
         NewPoolInfo {
             address: "0x390f3595bCa2Df7d23783dFd126427CCeb997BF4",
             token0: address!("f939E0A03FB07F59A73314E73794Be0E57ac1b4E"), // crvUSD
@@ -303,7 +278,7 @@ pub fn get_new_priority_pools() -> Vec<NewPoolInfo> {
             note: "Pegkeeper dynamics create spreads",
         },
 
-        // crvUSD/USDC
+        // crvUSD/USDC - standard 2-coin pool
         NewPoolInfo {
             address: "0x4DEcE678ceceb27446b35C672dC7d61F30bAD69E",
             token0: address!("f939E0A03FB07F59A73314E73794Be0E57ac1b4E"), // crvUSD
@@ -322,7 +297,7 @@ pub fn get_new_priority_pools() -> Vec<NewPoolInfo> {
         // FRAX ECOSYSTEM
         // ============================================
 
-        // FRAX/USDC - algorithmic stablecoin
+        // FRAX/USDC - standard 2-coin pool
         NewPoolInfo {
             address: "0xDcEF968d416a41Cdac0ED8702fAC8128A64241A2",
             token0: address!("853d955aCEf822Db058eb8505911ED77F175b99e"), // FRAX
@@ -338,42 +313,11 @@ pub fn get_new_priority_pools() -> Vec<NewPoolInfo> {
         },
 
         // ============================================
-        // GHO POOLS (Aave stablecoin)
+        // REMOVED PROBLEMATIC POOLS:
         // ============================================
-
-        // GHO/USDT
-        NewPoolInfo {
-            address: "0x...", // TODO: Look up from Curve factory
-            token0: address!("40D16FC0246aD3160Ccc09B8D0D3A2cD28aE6C2f"), // GHO
-            token1: address!("dAC17F958D2ee523a2206206994597C13D831ec7"), // USDT
-            token0_symbol: "GHO",
-            token1_symbol: "USDT",
-            token0_decimals: 18,  // GHO = 18 decimals
-            token1_decimals: 6,   // USDT = 6 decimals
-            fee: 4,
-            dex: Dex::Curve,
-            pool_type: PoolType::Curve,
-            note: "GHO discount/premium creates arb",
-        },
-
-        // ============================================
-        // DOLA POOLS (Inverse Finance)
-        // ============================================
-
-        // DOLA/USDC
-        NewPoolInfo {
-            address: "0xAA5A67c256e27A5d80712c51971408db3370927D",
-            token0: address!("865377367054516e17014CcdED1e7d814EDC9ce4"), // DOLA
-            token1: address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"), // USDC
-            token0_symbol: "DOLA",
-            token1_symbol: "USDC",
-            token0_decimals: 18,  // DOLA = 18 decimals
-            token1_decimals: 6,   // USDC = 6 decimals
-            fee: 4,
-            dex: Dex::Curve,
-            pool_type: PoolType::Curve,
-            note: "Leverage demand creates spreads",
-        },
+        // - DAI_USDS_CONVERTER (0x3225737a...) - Not a standard Curve pool
+        // - GHO/USDT (0x...) - Placeholder address
+        // - DOLA/USDC (0xAA5A67c2...) - Metapool (DOLA/3CRV), not 2-coin
     ]
 }
 
