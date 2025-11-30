@@ -119,7 +119,7 @@ pub struct PoolState {
 
 impl PoolState {
     pub fn price(&self, _: u8, _: u8) -> f64 { self.normalized_price() }
-    
+
     pub fn normalized_price(&self) -> f64 {
         match self.pool_type {
             PoolType::V3 => {
@@ -128,7 +128,17 @@ impl PoolState {
                 let price_raw = (sp / 2_f64.powi(96)).powi(2);
                 price_raw * 10_f64.powi(self.token0_decimals as i32 - self.token1_decimals as i32)
             }
+            PoolType::Curve => {
+                // For Curve pools, we now store actual get_dy price in sqrt_price_x96 format
+                // The price is already decimal-adjusted from the get_dy calculation
+                let sp = self.sqrt_price_x96.to::<u128>() as f64;
+                if sp == 0.0 { return 0.0; }
+                let price_raw = (sp / 2_f64.powi(96)).powi(2);
+                // Price is already decimal-adjusted from get_dy query
+                price_raw
+            }
             _ => {
+                // V2, Balancer - use reserve ratio
                 if self.liquidity == 0 || self.reserve1 == 0 { return 0.0; }
                 let price = (self.reserve1 as f64 / self.liquidity as f64)
                     * 10_f64.powi(self.token0_decimals as i32 - self.token1_decimals as i32);
@@ -140,7 +150,7 @@ impl PoolState {
             }
         }
     }
-    
+
     pub fn raw_price(&self) -> f64 { self.normalized_price() }
 }
 
