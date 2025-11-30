@@ -175,14 +175,34 @@ lazy_static::lazy_static! {
 
 pub fn get_token_decimals(address: &Address) -> u8 {
     let a = format!("{:?}", address).to_lowercase();
-    if a.contains("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48") 
-        || a.contains("dac17f958d2ee523a2206206994597c13d831ec7") { 
-        6 
-    } else if a.contains("2260fac5e5542a773aa44fbcfedf7c193bc2c599") { 
-        8 
-    } else { 
-        18 
+
+    // 6 decimals (stablecoins)
+    if a.contains("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48")  // USDC
+        || a.contains("dac17f958d2ee523a2206206994597c13d831ec7")  // USDT
+        || a.contains("6c3ea9036406852006290770bedfcaba0e23a0e8")  // pyUSD
+    {
+        return 6;
     }
+
+    // 8 decimals
+    if a.contains("2260fac5e5542a773aa44fbcfedf7c193bc2c599")  // WBTC
+        || a.contains("5b7533812759b45c2b44c19e320ba2cd2681b542")  // AGIX
+        || a.contains("d1d2eb1b1e90b638588728b4130137d262c87cae")  // GALA
+        || a.contains("e0f63a424a4439cbe457d80e4f4b51ad25b2c56c")  // SPX6900
+    {
+        return 8;
+    }
+
+    // 9 decimals (TAO ecosystem, FLOKI)
+    if a.contains("77e06c9eccf2e797fd462a92b6d7642ef85b0a44")  // wTAO
+        || a.contains("b60acd2057067dc9ed8c083f5aa227a244044fd6")  // stTAO
+        || a.contains("cf0c122c6b73ff809c693db761e7baebe62b6a2e")  // FLOKI
+    {
+        return 9;
+    }
+
+    // Default: 18 decimals
+    18
 }
 
 pub fn get_all_known_pools() -> Vec<PoolInfo> {
@@ -222,6 +242,84 @@ pub fn get_all_known_pools() -> Vec<PoolInfo> {
         PoolInfo { address: "0x6CA298D2983aB03Aa1dA7679389D955A4eFEE15C", token0_symbol: "WETH", token1_symbol: "USDT", fee: 500, dex: Dex::PancakeSwapV3, pool_type: PoolType::V3, weight0: None },
         // Balancer
         PoolInfo { address: "0x32296969Ef14EB0c6d29669C550D4a0449130230", token0_symbol: "wstETH", token1_symbol: "WETH", fee: 4, dex: Dex::BalancerV2, pool_type: PoolType::Balancer, weight0: Some(0.5) },
+
+        // ============================================
+        // AI/COMPUTE TOKEN POOLS
+        // ============================================
+
+        // RNDR - Multi-tier for fee arbitrage
+        PoolInfo { address: "0xe936f0073549ad8b1fa53583600d629ba9375161", token0_symbol: "RNDR", token1_symbol: "WETH", fee: 10000, dex: Dex::UniswapV3, pool_type: PoolType::V3, weight0: None },
+        PoolInfo { address: "0x4628a0a564debfc8798eb55db5c91f2200486c24", token0_symbol: "RNDR", token1_symbol: "WETH", fee: 3000, dex: Dex::UniswapV3, pool_type: PoolType::V3, weight0: None },
+
+        // FET - Multi-tier
+        PoolInfo { address: "0x948b54a93f5ad1df6b8bff6dc249d99ca2eca052", token0_symbol: "FET", token1_symbol: "WETH", fee: 10000, dex: Dex::UniswapV3, pool_type: PoolType::V3, weight0: None },
+        PoolInfo { address: "0x744159757cac173a7a3ecf5e97adb10d1a725377", token0_symbol: "FET", token1_symbol: "WETH", fee: 3000, dex: Dex::UniswapV3, pool_type: PoolType::V3, weight0: None },
+
+        // wTAO
+        PoolInfo { address: "0x2982d3295a0e1a99e6e88ece0e93ffdfc5c761ae", token0_symbol: "wTAO", token1_symbol: "WETH", fee: 3000, dex: Dex::UniswapV3, pool_type: PoolType::V3, weight0: None },
+        PoolInfo { address: "0xf763bb342eb3d23c02ccb86312422fe0c1c17e94", token0_symbol: "wTAO", token1_symbol: "USDC", fee: 10000, dex: Dex::UniswapV3, pool_type: PoolType::V3, weight0: None },
+
+        // stTAO (yield-bearing) - for wTAO/stTAO arbitrage
+        PoolInfo { address: "0xb60acd2057067dc9ed8c083f5aa227a244044fd6", token0_symbol: "stTAO", token1_symbol: "WETH", fee: 3000, dex: Dex::UniswapV3, pool_type: PoolType::V3, weight0: None },
+
+        // ============================================
+        // GAMING TOKEN POOLS
+        // ============================================
+
+        // IMX
+        PoolInfo { address: "0xFd76bE67FFF3BAC84E3D5444167bbc018f5968b6", token0_symbol: "IMX", token1_symbol: "WETH", fee: 10000, dex: Dex::UniswapV3, pool_type: PoolType::V3, weight0: None },
+
+        // GALA
+        PoolInfo { address: "0x465e56cd21ad47d4d4790f17de5e0458f20c3719", token0_symbol: "GALA", token1_symbol: "WETH", fee: 3000, dex: Dex::UniswapV3, pool_type: PoolType::V3, weight0: None },
+
+        // SAND - V2 pool (higher liquidity)
+        PoolInfo { address: "0x3dd49f67e9d5bc4c5e6634b3f70bfd9dc1b6bd74", token0_symbol: "SAND", token1_symbol: "WETH", fee: 3000, dex: Dex::UniswapV2, pool_type: PoolType::V2, weight0: None },
+
+        // AXS
+        PoolInfo { address: "0x3019d4e366576a88d28b623afaf3ecb9ec9d9580", token0_symbol: "AXS", token1_symbol: "WETH", fee: 3000, dex: Dex::UniswapV3, pool_type: PoolType::V3, weight0: None },
+
+        // ============================================
+        // MEME TOKEN POOLS (V2/V3 DUAL - PRIMARY ARB TARGETS)
+        // ============================================
+
+        // MOG - V2 ($12M liquidity) and V3 ($229K) - ideal fee-tier arbitrage
+        PoolInfo { address: "0xc2eab7d33d3cb97692ecb231a5d0e4a649cb539d", token0_symbol: "MOG", token1_symbol: "WETH", fee: 3000, dex: Dex::UniswapV2, pool_type: PoolType::V2, weight0: None },
+        PoolInfo { address: "0x7832310cd0de39c4ce0a635f34d9a4b5b47fd434", token0_symbol: "MOG", token1_symbol: "WETH", fee: 10000, dex: Dex::UniswapV3, pool_type: PoolType::V3, weight0: None },
+
+        // SPX6900 - V2 only ($13M)
+        PoolInfo { address: "0x52c77b0cb827afbad022e6d6caf2c44452edbc39", token0_symbol: "SPX6900", token1_symbol: "WETH", fee: 3000, dex: Dex::UniswapV2, pool_type: PoolType::V2, weight0: None },
+
+        // TURBO
+        PoolInfo { address: "0x7baece5d47f1bc5e1953fbe0e9931d54dab6d810", token0_symbol: "TURBO", token1_symbol: "WETH", fee: 10000, dex: Dex::UniswapV3, pool_type: PoolType::V3, weight0: None },
+
+        // FLOKI
+        PoolInfo { address: "0x7929d24b5bc6e06bfc7a0d5e51c340c2ad952f69", token0_symbol: "FLOKI", token1_symbol: "WETH", fee: 10000, dex: Dex::UniswapV3, pool_type: PoolType::V3, weight0: None },
+
+        // ============================================
+        // RESTAKING TOKEN POOLS
+        // ============================================
+
+        // EIGEN
+        PoolInfo { address: "0xc2c390c6cd3c4e6c2b70727d35a45e8a072f18ca", token0_symbol: "EIGEN", token1_symbol: "WETH", fee: 3000, dex: Dex::UniswapV3, pool_type: PoolType::V3, weight0: None },
+
+        // ezETH - Balancer stable pool
+        PoolInfo { address: "0x596192bb6e41802428ac943d2f1476c1af25cc0e", token0_symbol: "ezETH", token1_symbol: "WETH", fee: 50, dex: Dex::BalancerV2, pool_type: PoolType::Balancer, weight0: Some(0.5) },
+
+        // weETH - Curve pool
+        PoolInfo { address: "0x13947303f63b363876868d070f14dc865c36463b", token0_symbol: "weETH", token1_symbol: "WETH", fee: 4, dex: Dex::Curve, pool_type: PoolType::Curve, weight0: None },
+
+        // pufETH - Curve NG pool (NAV discount arbitrage target)
+        PoolInfo { address: "0xB3c8Ce1eE157b0DCAa96897C9170aEe6281706c9", token0_symbol: "pufETH", token1_symbol: "wstETH", fee: 4, dex: Dex::Curve, pool_type: PoolType::Curve, weight0: None },
+
+        // ============================================
+        // RWA TOKEN POOLS
+        // ============================================
+
+        // ONDO
+        PoolInfo { address: "0x7b1e5d984a43ee732de195628d20d05cfabc3cc7", token0_symbol: "ONDO", token1_symbol: "WETH", fee: 3000, dex: Dex::UniswapV3, pool_type: PoolType::V3, weight0: None },
+
+        // SYRUP
+        PoolInfo { address: "0x11e451c1f5cb0c0d2885c3e8687b14bcf9b0c82d", token0_symbol: "SYRUP", token1_symbol: "USDC", fee: 3000, dex: Dex::UniswapV3, pool_type: PoolType::V3, weight0: None },
     ]
 }
 
