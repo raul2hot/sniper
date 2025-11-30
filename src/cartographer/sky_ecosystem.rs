@@ -1,4 +1,4 @@
-//! Sky Ecosystem Adapter - Phase 2
+//! Sky Ecosystem Adapter - Phase 2 (MULTICALL OPTIMIZED)
 //!
 //! Integration with Sky Protocol (formerly MakerDAO) for:
 //! - USDS/DAI migration paths (1:1 swap)
@@ -8,8 +8,11 @@
 //! Key arbitrage opportunity:
 //! sUSDS's value DRIFTS upward continuously due to yield accrual.
 //! When DEX price lags behind the true redemption value, arbitrage exists.
+//!
+//! OPTIMIZATION: Uses Multicall3 to batch all vault state fetches into
+//! a single RPC call instead of 10+ individual calls.
 
-use alloy_primitives::{Address, U256, address};
+use alloy_primitives::{Address, Bytes, U256, address};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_sol_types::{sol, SolCall};
 use alloy_rpc_types::TransactionRequest;
@@ -40,6 +43,9 @@ pub const DAI_USDS_CONVERTER: Address = address!("3225737a9Bbb6473CB4a45b7244ACa
 
 /// Sky Savings Rate Module (SSR)
 pub const SSR_MODULE: Address = address!("a3931d71877C0E7a3148CB7Eb4463524FEc27fbD"); // sUSDS is the module
+
+/// Multicall3 address (same on all EVM chains)
+const MULTICALL3: Address = address!("cA11bde05977b3631167028862bE2a173976CA11");
 
 // ============================================
 // SOLIDITY INTERFACES
@@ -89,12 +95,29 @@ sol! {
     interface ISSR {
         // Current savings rate (ray precision = 1e27)
         function ssr() external view returns (uint256);
-        
+
         // Rate accumulator (chi)
         function chi() external view returns (uint256);
-        
+
         // Last update timestamp
         function rho() external view returns (uint256);
+    }
+
+    /// Multicall3 interface for batching
+    interface IMulticall3 {
+        struct Call3 {
+            address target;
+            bool allowFailure;
+            bytes callData;
+        }
+
+        struct Result {
+            bool success;
+            bytes returnData;
+        }
+
+        function aggregate3(Call3[] calldata calls)
+            external payable returns (Result[] memory returnData);
     }
 }
 
@@ -203,10 +226,11 @@ pub struct YieldDriftArb {
 }
 
 // ============================================
-// SKY ECOSYSTEM ADAPTER
+// SKY ECOSYSTEM ADAPTER (MULTICALL OPTIMIZED)
 // ============================================
 
 /// Adapter for Sky Protocol integration
+/// OPTIMIZED: Uses Multicall3 to fetch all vault data in 1 RPC call
 pub struct SkyAdapter {
     rpc_url: String,
 }
@@ -215,141 +239,154 @@ impl SkyAdapter {
     pub fn new(rpc_url: String) -> Self {
         Self { rpc_url }
     }
-    
-    /// Helper to call a contract
-    async fn call_contract(&self, to: Address, calldata: Vec<u8>) -> Result<Vec<u8>> {
+
+    /// Execute a Multicall3 batch - SINGLE RPC CALL for all data
+    async fn execute_multicall(&self, calls: Vec<IMulticall3::Call3>) -> Result<Vec<IMulticall3::Result>> {
+        if calls.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let provider = ProviderBuilder::new()
             .on_http(self.rpc_url.parse()?);
-        
+
+        let calldata = IMulticall3::aggregate3Call { calls }.abi_encode();
+
         let tx = TransactionRequest::default()
-            .to(to)
+            .to(MULTICALL3)
             .input(calldata.into());
-        
+
         let result = provider.call(tx).await
-            .map_err(|e| eyre!("eth_call failed: {}", e))?;
-        
-        Ok(result.to_vec())
+            .map_err(|e| eyre!("Multicall3 failed: {}", e))?;
+
+        let decoded = IMulticall3::aggregate3Call::abi_decode_returns(&result)
+            .map_err(|e| eyre!("Failed to decode multicall result: {}", e))?;
+
+        Ok(decoded)
     }
-    
-    /// Fetch current sUSDS state
-    pub async fn fetch_susds_state(&self) -> Result<ERC4626State> {
-        self.fetch_erc4626_state(SUSDS_TOKEN, "sUSDS", "USDS").await
-    }
-    
-    /// Fetch current sDAI state
-    pub async fn fetch_sdai_state(&self) -> Result<ERC4626State> {
-        self.fetch_erc4626_state(SDAI_TOKEN, "sDAI", "DAI").await
-    }
-    
-    /// Generic ERC-4626 state fetcher
-    pub async fn fetch_erc4626_state(
-        &self,
-        vault: Address,
-        symbol: &str,
-        underlying_symbol: &str,
-    ) -> Result<ERC4626State> {
-        // Get underlying asset
-        let calldata = IERC4626::assetCall {}.abi_encode();
-        let output = self.call_contract(vault, calldata).await?;
-        let underlying = IERC4626::assetCall::abi_decode_returns(&output)?;
-        
-        // Get conversion rates (using 1e18 as base)
-        let one_unit = U256::from(10u64.pow(18));
-        
-        // Assets per share: convertToAssets(1e18)
-        let calldata = IERC4626::convertToAssetsCall { shares: one_unit }.abi_encode();
-        let output = self.call_contract(vault, calldata).await?;
-        let assets_per_share = IERC4626::convertToAssetsCall::abi_decode_returns(&output)?;
-        
-        // Shares per asset: convertToShares(1e18)
-        let calldata = IERC4626::convertToSharesCall { assets: one_unit }.abi_encode();
-        let output = self.call_contract(vault, calldata).await?;
-        let shares_per_asset = IERC4626::convertToSharesCall::abi_decode_returns(&output)?;
-        
-        // Get total values
-        let calldata = IERC4626::totalAssetsCall {}.abi_encode();
-        let output = self.call_contract(vault, calldata).await?;
-        let total_assets = IERC4626::totalAssetsCall::abi_decode_returns(&output)?;
-        
-        let calldata = IERC4626::totalSupplyCall {}.abi_encode();
-        let output = self.call_contract(vault, calldata).await?;
-        let total_supply = IERC4626::totalSupplyCall::abi_decode_returns(&output)?;
-        
-        // Calculate fair value (assuming underlying is ~$1 for stablecoins)
-        let fair_value_usd = assets_per_share.to::<u128>() as f64 / 1e18;
-        
-        info!(
-            "📊 {} exchange rate: 1 {} = {:.6} {}",
-            symbol,
-            symbol,
-            fair_value_usd,
-            underlying_symbol
-        );
-        
-        Ok(ERC4626State {
-            vault_address: vault,
-            underlying_asset: underlying,
-            symbol: symbol.to_string(),
-            underlying_symbol: underlying_symbol.to_string(),
-            assets_per_share,
-            shares_per_asset,
-            total_assets,
-            total_supply,
-            dex_price: None,
-            fair_value_usd,
-        })
-    }
-    
-    /// Get redemption value for a specific amount of shares
-    pub async fn preview_redeem(&self, vault: Address, shares: U256) -> Result<U256> {
-        let calldata = IERC4626::previewRedeemCall { shares }.abi_encode();
-        let output = self.call_contract(vault, calldata).await?;
-        let assets = IERC4626::previewRedeemCall::abi_decode_returns(&output)?;
-        Ok(assets)
-    }
-    
-    /// Get deposit preview (how many shares for assets)
-    pub async fn preview_deposit(&self, vault: Address, assets: U256) -> Result<U256> {
-        let calldata = IERC4626::previewDepositCall { assets }.abi_encode();
-        let output = self.call_contract(vault, calldata).await?;
-        let shares = IERC4626::previewDepositCall::abi_decode_returns(&output)?;
-        Ok(shares)
-    }
-    
-    /// Check DAI -> USDS conversion rate (should be 1:1)
-    pub async fn get_dai_usds_rate(&self) -> Result<f64> {
-        // DAI-USDS conversion is always 1:1 in the Sky protocol
-        // But there might be gas costs or limits
-        Ok(1.0)
-    }
-    
-    /// Fetch all ERC-4626 vaults we care about
+
+    /// OPTIMIZED: Fetch ALL vaults in a SINGLE multicall (1 RPC call instead of 10+)
     pub async fn fetch_all_vaults(&self) -> Result<Vec<ERC4626State>> {
-        let mut vaults = Vec::new();
-        
-        // sUSDS
-        match self.fetch_susds_state().await {
-            Ok(state) => vaults.push(state),
-            Err(e) => warn!("Failed to fetch sUSDS state: {}", e),
+        let vaults_to_fetch: Vec<(Address, &str, &str, Address)> = vec![
+            (SUSDS_TOKEN, "sUSDS", "USDS", USDS_TOKEN),
+            (SDAI_TOKEN, "sDAI", "DAI", DAI_TOKEN),
+        ];
+
+        let one_unit = U256::from(10u64.pow(18));
+
+        // Build ALL calls for ALL vaults in one batch
+        // Per vault: convertToAssets, convertToShares, totalAssets, totalSupply = 4 calls
+        // 2 vaults × 4 calls = 8 calls in 1 multicall (was 10 individual RPC calls)
+        let mut calls: Vec<IMulticall3::Call3> = Vec::new();
+
+        for (vault, _, _, _) in &vaults_to_fetch {
+            // convertToAssets(1e18) - assets per share
+            calls.push(IMulticall3::Call3 {
+                target: *vault,
+                allowFailure: true,
+                callData: IERC4626::convertToAssetsCall { shares: one_unit }.abi_encode().into(),
+            });
+            // convertToShares(1e18) - shares per asset
+            calls.push(IMulticall3::Call3 {
+                target: *vault,
+                allowFailure: true,
+                callData: IERC4626::convertToSharesCall { assets: one_unit }.abi_encode().into(),
+            });
+            // totalAssets
+            calls.push(IMulticall3::Call3 {
+                target: *vault,
+                allowFailure: true,
+                callData: IERC4626::totalAssetsCall {}.abi_encode().into(),
+            });
+            // totalSupply
+            calls.push(IMulticall3::Call3 {
+                target: *vault,
+                allowFailure: true,
+                callData: IERC4626::totalSupplyCall {}.abi_encode().into(),
+            });
         }
-        
-        // sDAI
-        match self.fetch_sdai_state().await {
-            Ok(state) => vaults.push(state),
-            Err(e) => warn!("Failed to fetch sDAI state: {}", e),
+
+        debug!("Sky ecosystem: fetching {} vaults with {} calls in 1 multicall", vaults_to_fetch.len(), calls.len());
+
+        let results = self.execute_multicall(calls).await?;
+
+        // Parse results (4 calls per vault)
+        let mut vault_states = Vec::new();
+
+        for (i, (vault, symbol, underlying_symbol, underlying)) in vaults_to_fetch.iter().enumerate() {
+            let offset = i * 4;
+
+            if offset + 3 >= results.len() {
+                warn!("Insufficient results for vault {}", symbol);
+                continue;
+            }
+
+            // Parse convertToAssets
+            let assets_per_share = if results[offset].success {
+                IERC4626::convertToAssetsCall::abi_decode_returns(&results[offset].returnData)
+                    .unwrap_or(U256::from(10u64.pow(18)))
+            } else {
+                warn!("Failed to fetch assets_per_share for {}", symbol);
+                continue;
+            };
+
+            // Parse convertToShares
+            let shares_per_asset = if results[offset + 1].success {
+                IERC4626::convertToSharesCall::abi_decode_returns(&results[offset + 1].returnData)
+                    .unwrap_or(U256::from(10u64.pow(18)))
+            } else {
+                warn!("Failed to fetch shares_per_asset for {}", symbol);
+                continue;
+            };
+
+            // Parse totalAssets
+            let total_assets = if results[offset + 2].success {
+                IERC4626::totalAssetsCall::abi_decode_returns(&results[offset + 2].returnData)
+                    .unwrap_or(U256::ZERO)
+            } else {
+                U256::ZERO
+            };
+
+            // Parse totalSupply
+            let total_supply = if results[offset + 3].success {
+                IERC4626::totalSupplyCall::abi_decode_returns(&results[offset + 3].returnData)
+                    .unwrap_or(U256::ZERO)
+            } else {
+                U256::ZERO
+            };
+
+            let fair_value_usd = assets_per_share.to::<u128>() as f64 / 1e18;
+
+            debug!(
+                "📊 {} exchange rate: 1 {} = {:.6} {}",
+                symbol, symbol, fair_value_usd, underlying_symbol
+            );
+
+            vault_states.push(ERC4626State {
+                vault_address: *vault,
+                underlying_asset: *underlying,
+                symbol: symbol.to_string(),
+                underlying_symbol: underlying_symbol.to_string(),
+                assets_per_share,
+                shares_per_asset,
+                total_assets,
+                total_supply,
+                dex_price: None,
+                fair_value_usd,
+            });
         }
-        
-        Ok(vaults)
+
+        info!("✅ Sky ecosystem: fetched {} vaults in 1 RPC call", vault_states.len());
+        Ok(vault_states)
     }
-    
+
     /// Check for yield drift arbitrage across all vaults
-    pub async fn check_yield_drift_arbs(
+    pub fn check_yield_drift_arbs(
         &self,
         vault_states: &[ERC4626State],
         min_profit_bps: f64,
     ) -> Vec<YieldDriftArb> {
         let mut arbs = Vec::new();
-        
+
         for state in vault_states {
             if let Some(arb) = state.check_arb_opportunity(min_profit_bps) {
                 info!(
@@ -359,8 +396,14 @@ impl SkyAdapter {
                 arbs.push(arb);
             }
         }
-        
+
         arbs
+    }
+
+    /// Check DAI -> USDS conversion rate (should be 1:1)
+    pub fn get_dai_usds_rate(&self) -> f64 {
+        // DAI-USDS conversion is always 1:1 in the Sky protocol
+        1.0
     }
 }
 

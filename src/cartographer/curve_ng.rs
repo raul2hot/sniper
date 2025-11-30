@@ -1,4 +1,4 @@
-//! Curve StableSwap NG Pool Adapter - Phase 1 (MULTICALL OPTIMIZED)
+//! Curve StableSwap NG Pool Adapter - Phase 1 (MULTICALL OPTIMIZED + CACHED)
 //!
 //! Dynamic pool discovery and quoting for Curve NG pools.
 //! Key features:
@@ -7,6 +7,7 @@
 //! - Support for exchange_received() (approval-free swaps)
 //! - ERC-4626 token support in pools
 //! - MULTICALL3 batching for fast discovery (~6 RPC calls instead of 1000+)
+//! - CACHING: Pool structure cached for 5 minutes, only balances refreshed each scan
 
 use alloy_primitives::{Address, Bytes, U256, address};
 use alloy_provider::{Provider, ProviderBuilder};
@@ -14,6 +15,8 @@ use alloy_sol_types::{sol, SolCall};
 use alloy_rpc_types::TransactionRequest;
 use eyre::{eyre, Result};
 use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 use tracing::{debug, info, trace, warn};
 
 use super::{Dex, PoolState, PoolType, get_token_decimals};
@@ -39,6 +42,34 @@ pub const MIN_TVL_USD: f64 = 50_000.0;
 
 /// Maximum number of pools to fetch per factory
 pub const MAX_POOLS_PER_FACTORY: usize = 100;
+
+/// Cache duration for pool structure (addresses, coins, fees)
+/// Pool structure rarely changes, so we cache for 5 minutes
+pub const POOL_STRUCTURE_CACHE_SECS: u64 = 300;
+
+// ============================================
+// POOL CACHE STRUCTURE
+// ============================================
+
+/// Cached pool metadata (doesn't change often)
+#[derive(Debug, Clone)]
+pub struct CachedPoolMetadata {
+    pub address: Address,
+    pub coins: Vec<Address>,
+    pub decimals: Vec<u8>,
+    pub n_coins: usize,
+    pub base_fee: u32,
+    pub offpeg_multiplier: u32,
+    pub has_erc4626: bool,
+    pub factory: CurveNGFactoryType,
+}
+
+/// Cache entry with timestamp
+#[derive(Debug, Clone)]
+struct PoolCache {
+    pools: Vec<CachedPoolMetadata>,
+    last_updated: Instant,
+}
 
 // ============================================
 // SOLIDITY INTERFACES
@@ -190,17 +221,55 @@ impl CurveNGPool {
 }
 
 // ============================================
-// CURVE NG FETCHER (MULTICALL OPTIMIZED)
+// CURVE NG FETCHER (MULTICALL OPTIMIZED + CACHED)
 // ============================================
 
-/// Fetches Curve NG pools using Multicall3 batching
+/// Fetches Curve NG pools using Multicall3 batching with caching
+/// OPTIMIZATION: Pool structure cached for 5 minutes, only balances refreshed
 pub struct CurveNGFetcher {
     rpc_url: String,
+    /// Cache for pool metadata (addresses, coins, fees) - rarely changes
+    pool_cache: Arc<RwLock<Option<PoolCache>>>,
 }
 
 impl CurveNGFetcher {
     pub fn new(rpc_url: String) -> Self {
-        Self { rpc_url }
+        Self {
+            rpc_url,
+            pool_cache: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    /// Check if cache is valid
+    fn is_cache_valid(&self) -> bool {
+        if let Ok(guard) = self.pool_cache.read() {
+            if let Some(ref cache) = *guard {
+                return cache.last_updated.elapsed() < Duration::from_secs(POOL_STRUCTURE_CACHE_SECS);
+            }
+        }
+        false
+    }
+
+    /// Get cached pool metadata if valid
+    fn get_cached_metadata(&self) -> Option<Vec<CachedPoolMetadata>> {
+        if let Ok(guard) = self.pool_cache.read() {
+            if let Some(ref cache) = *guard {
+                if cache.last_updated.elapsed() < Duration::from_secs(POOL_STRUCTURE_CACHE_SECS) {
+                    return Some(cache.pools.clone());
+                }
+            }
+        }
+        None
+    }
+
+    /// Update the cache
+    fn update_cache(&self, pools: Vec<CachedPoolMetadata>) {
+        if let Ok(mut guard) = self.pool_cache.write() {
+            *guard = Some(PoolCache {
+                pools,
+                last_updated: Instant::now(),
+            });
+        }
     }
     
     /// Execute a Multicall3 batch
@@ -464,39 +533,184 @@ impl CurveNGFetcher {
         Ok(dy)
     }
     
-    /// Discover all NG pools across all factories
+    /// OPTIMIZED: Discover all NG pools with caching
+    /// - If cache valid: Only fetch balances (1 multicall instead of 9+)
+    /// - If cache expired: Full discovery + update cache
     pub async fn discover_all_ng_pools(&self) -> Result<Vec<CurveNGPool>> {
+        // Check if we have valid cached metadata
+        if let Some(cached_metadata) = self.get_cached_metadata() {
+            info!("📦 Using cached Curve NG pool structure ({} pools), refreshing balances only...", cached_metadata.len());
+            return self.refresh_balances_only(&cached_metadata).await;
+        }
+
+        info!("🔍 Cache expired/empty, performing full Curve NG discovery...");
         let mut all_pools = Vec::new();
-        
+        let mut all_metadata = Vec::new();
+
         // StableSwap NG (highest priority - stablecoin pools)
         match self.discover_stableswap_ng_pools().await {
             Ok(pools) => {
                 info!("  StableSwap NG: {} pools", pools.len());
+                // Extract metadata for caching
+                for pool in &pools {
+                    all_metadata.push(CachedPoolMetadata {
+                        address: pool.address,
+                        coins: pool.coins.clone(),
+                        decimals: pool.decimals.clone(),
+                        n_coins: pool.n_coins,
+                        base_fee: pool.base_fee,
+                        offpeg_multiplier: pool.offpeg_multiplier,
+                        has_erc4626: pool.has_erc4626,
+                        factory: pool.factory,
+                    });
+                }
                 all_pools.extend(pools);
             }
             Err(e) => warn!("Failed to fetch StableSwap NG pools: {}", e),
         }
-        
+
         // TwoCrypto NG (volatile pairs)
         match self.discover_twocrypto_ng_pools().await {
             Ok(pools) => {
                 info!("  TwoCrypto NG: {} pools", pools.len());
+                for pool in &pools {
+                    all_metadata.push(CachedPoolMetadata {
+                        address: pool.address,
+                        coins: pool.coins.clone(),
+                        decimals: pool.decimals.clone(),
+                        n_coins: pool.n_coins,
+                        base_fee: pool.base_fee,
+                        offpeg_multiplier: pool.offpeg_multiplier,
+                        has_erc4626: pool.has_erc4626,
+                        factory: pool.factory,
+                    });
+                }
                 all_pools.extend(pools);
             }
             Err(e) => warn!("Failed to fetch TwoCrypto NG pools: {}", e),
         }
-        
+
         // TriCrypto NG (3-asset pools)
         match self.discover_tricrypto_ng_pools().await {
             Ok(pools) => {
                 info!("  TriCrypto NG: {} pools", pools.len());
+                for pool in &pools {
+                    all_metadata.push(CachedPoolMetadata {
+                        address: pool.address,
+                        coins: pool.coins.clone(),
+                        decimals: pool.decimals.clone(),
+                        n_coins: pool.n_coins,
+                        base_fee: pool.base_fee,
+                        offpeg_multiplier: pool.offpeg_multiplier,
+                        has_erc4626: pool.has_erc4626,
+                        factory: pool.factory,
+                    });
+                }
                 all_pools.extend(pools);
             }
             Err(e) => warn!("Failed to fetch TriCrypto NG pools: {}", e),
         }
-        
+
+        // Update cache with discovered metadata
+        info!("💾 Caching {} pool structures for {} seconds", all_metadata.len(), POOL_STRUCTURE_CACHE_SECS);
+        self.update_cache(all_metadata);
+
         info!("📊 Total Curve NG pools discovered: {}", all_pools.len());
         Ok(all_pools)
+    }
+
+    /// FAST PATH: Refresh only balances using cached metadata (1 multicall)
+    async fn refresh_balances_only(&self, cached: &[CachedPoolMetadata]) -> Result<Vec<CurveNGPool>> {
+        if cached.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Group pools by factory for efficient batching
+        let mut stableswap_pools: Vec<&CachedPoolMetadata> = Vec::new();
+        let mut twocrypto_pools: Vec<&CachedPoolMetadata> = Vec::new();
+        let mut tricrypto_pools: Vec<&CachedPoolMetadata> = Vec::new();
+
+        for pool in cached {
+            match pool.factory {
+                CurveNGFactoryType::StableSwapNG => stableswap_pools.push(pool),
+                CurveNGFactoryType::TwoCryptoNG => twocrypto_pools.push(pool),
+                CurveNGFactoryType::TriCryptoNG => tricrypto_pools.push(pool),
+            }
+        }
+
+        // Build single multicall for all balance fetches
+        let mut calls: Vec<IMulticall3::Call3> = Vec::new();
+        let mut pool_refs: Vec<&CachedPoolMetadata> = Vec::new();
+
+        // Add balance calls for each pool from its factory
+        for pool in &stableswap_pools {
+            calls.push(IMulticall3::Call3 {
+                target: CURVE_NG_FACTORY,
+                allowFailure: true,
+                callData: ICurveNGFactory::get_balancesCall { pool: pool.address }.abi_encode().into(),
+            });
+            pool_refs.push(pool);
+        }
+        for pool in &twocrypto_pools {
+            calls.push(IMulticall3::Call3 {
+                target: CURVE_TWOCRYPTO_NG_FACTORY,
+                allowFailure: true,
+                callData: ICurveNGFactory::get_balancesCall { pool: pool.address }.abi_encode().into(),
+            });
+            pool_refs.push(pool);
+        }
+        for pool in &tricrypto_pools {
+            calls.push(IMulticall3::Call3 {
+                target: CURVE_TRICRYPTO_NG_FACTORY,
+                allowFailure: true,
+                callData: ICurveNGFactory::get_balancesCall { pool: pool.address }.abi_encode().into(),
+            });
+            pool_refs.push(pool);
+        }
+
+        debug!("Refreshing balances for {} pools in 1 multicall", calls.len());
+        let results = self.execute_multicall(calls).await?;
+
+        // Parse results and reconstruct full pool data
+        let mut pools = Vec::new();
+        for (i, pool_meta) in pool_refs.iter().enumerate() {
+            if i >= results.len() || !results[i].success {
+                continue;
+            }
+
+            let balances: Vec<U256> = ICurveNGFactory::get_balancesCall::abi_decode_returns(&results[i].returnData)
+                .ok()
+                .map(|b| b.into_iter().take(pool_meta.n_coins).collect())
+                .unwrap_or_default();
+
+            if balances.len() < pool_meta.n_coins {
+                continue;
+            }
+
+            // TVL filter
+            let tvl = estimate_tvl(&balances, &pool_meta.decimals);
+            if tvl < MIN_TVL_USD {
+                continue;
+            }
+
+            pools.push(CurveNGPool {
+                address: pool_meta.address,
+                coins: pool_meta.coins.clone(),
+                decimals: pool_meta.decimals.clone(),
+                balances,
+                n_coins: pool_meta.n_coins,
+                base_fee: pool_meta.base_fee,
+                offpeg_multiplier: pool_meta.offpeg_multiplier,
+                amplification: U256::from(100),
+                virtual_price: U256::from(10u64.pow(18)),
+                gauge: None,
+                has_erc4626: pool_meta.has_erc4626,
+                factory: pool_meta.factory,
+            });
+        }
+
+        info!("✅ Refreshed {} pool balances in 1 RPC call (cache hit)", pools.len());
+        Ok(pools)
     }
     
     /// Convert discovered pools to PoolState for graph integration
