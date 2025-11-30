@@ -117,30 +117,52 @@ pub fn get_priority_tokens() -> Vec<(Address, &'static str, u8)> {
         (address!("dAC17F958D2ee523a2206206994597C13D831ec7"), "USDT", 6),
         (address!("6B175474E89094C44Da98b954EedcdeCB5BE3830"), "DAI", 18),
         (address!("2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599"), "WBTC", 8),
-        
+
         // SKY Ecosystem (NEW - Phase 2)
         (USDS_TOKEN, "USDS", 18),
         (SUSDS_TOKEN, "sUSDS", 18),
         (SDAI_TOKEN, "sDAI", 18),
-        
+
         // USD3 (NEW - Phase 3)
         (USD3_TOKEN, "USD3", 18),
-        
+
         // Curve crvUSD
         (address!("f939E0A03FB07F59A73314E73794Be0E57ac1b4E"), "crvUSD", 18),
-        
+
         // FRAX ecosystem
         (address!("853d955aCEf822Db058eb8505911ED77F175b99e"), "FRAX", 18),
         (address!("3432B6A60D23Ca0dFCa7761B7ab56459D9C964D0"), "FXS", 18),
-        
+
         // DOLA (Inverse Finance)
         (address!("865377367054516e17014CcdED1e7d814EDC9ce4"), "DOLA", 18),
-        
+
         // GHO (Aave)
         (address!("40D16FC0246aD3160Ccc09B8D0D3A2cD28aE6C2f"), "GHO", 18),
-        
+
         // pyUSD (PayPal)
         (address!("6c3ea9036406852006290770BEdFcAbA0e23A0e8"), "pyUSD", 6),
+
+        // ============================================
+        // HIGH VOLATILITY TOKENS (Q4 2025)
+        // ============================================
+
+        // AI/Compute tokens
+        (address!("6de037ef9ad2725eb40118bb1702ebb27e4aeb24"), "RNDR", 18),
+        (address!("aea46A60368A7bD060eec7DF8CBa43b7EF41Ad85"), "FET", 18),
+        (address!("77e06c9eccf2e797fd462a92b6d7642ef85b0a44"), "wTAO", 9),
+
+        // Meme tokens (V2/V3 arb targets)
+        (address!("aaee1a9723aadb7afa2810263653a34ba2c21c7a"), "MOG", 18),
+        (address!("e0f63a424a4439cbe457d80e4f4b51ad25b2c56c"), "SPX6900", 8),
+
+        // Restaking tokens (NAV discount)
+        (address!("ec53bF9167f50cDEB3Ae105f56099aaaB9061F83"), "EIGEN", 18),
+        (address!("D9A442856C234a39a81a089C06451EBAa4306a72"), "pufETH", 18),
+        (address!("bf5495Efe5DB9ce00f80364C8B423567e58d2110"), "ezETH", 18),
+
+        // RWA tokens
+        (address!("fAbA6f8e4a5E8Ab82F62fe7C39859FA577269BE3"), "ONDO", 18),
+        (address!("96F6eF951840721AdBF46Ac996b59E0235CB985C"), "USDY", 18),
     ]
 }
 
@@ -162,8 +184,8 @@ pub fn build_expanded_symbol_map() -> HashMap<Address, &'static str> {
         map.insert(addr, symbol);
     }
     
-    // STEP 3: Add tokens discovered from Curve NG
-    let additional: [(&str, &str); 15] = [
+    // STEP 3: Add tokens discovered from Curve NG and high-volatility tokens
+    let additional: [(&str, &str); 40] = [
         ("0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0", "wstETH"),
         ("0x514910771AF9Ca656af840dff83E8264EcF986CA", "LINK"),
         ("0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984", "UNI"),
@@ -179,14 +201,44 @@ pub fn build_expanded_symbol_map() -> HashMap<Address, &'static str> {
         ("0x4591DBfF62656E7859Afe5e45f6f47D3669fBB28", "OETH"),
         ("0x73968b9a57c6E53d41345FD57a6E6ae27d6CDb2F", "sUSDe"),
         ("0x5Ca135cB8527d76e932f34B5145575F9d8cBe08E", "PT-sUSDe"),
+        // AI/Compute tokens
+        ("0x6de037ef9ad2725eb40118bb1702ebb27e4aeb24", "RNDR"),
+        ("0xaea46A60368A7bD060eec7DF8CBa43b7EF41Ad85", "FET"),
+        ("0x5B7533812759B45C2B44C19e320ba2cD2681b542", "AGIX"),
+        ("0x77e06c9eccf2e797fd462a92b6d7642ef85b0a44", "wTAO"),
+        ("0xb60acd2057067dc9ed8c083f5aa227a244044fd6", "stTAO"),
+        // Gaming tokens
+        ("0xf57e7e7c23978c3caec3c3548e3d615c346e79ff", "IMX"),
+        ("0xd1d2eb1b1e90b638588728b4130137d262c87cae", "GALA"),
+        ("0x3845badAde8e6dFF049820680d1F14bD3903a5d0", "SAND"),
+        ("0xbb0e17ef65f82ab018d8edd776e8dd940327b28b", "AXS"),
+        // Meme tokens
+        ("0xaaee1a9723aadb7afa2810263653a34ba2c21c7a", "MOG"),
+        ("0xe0f63a424a4439cbe457d80e4f4b51ad25b2c56c", "SPX6900"),
+        ("0xa35923162c49cf95e6bf26623385eb431ad920d3", "TURBO"),
+        ("0xcf0c122c6b73ff809c693db761e7baebe62b6a2e", "FLOKI"),
+        // Restaking tokens
+        ("0xec53bF9167f50cDEB3Ae105f56099aaaB9061F83", "EIGEN"),
+        ("0x3B50805453023a91a8bf641e279401a0b23FA6F9", "REZ"),
+        ("0x4d1C297d39C5c1277964D0E3f8Aa901493664530", "PUFFER"),
+        ("0xD9A442856C234a39a81a089C06451EBAa4306a72", "pufETH"),
+        ("0xbf5495Efe5DB9ce00f80364C8B423567e58d2110", "ezETH"),
+        ("0x35fA164735182de50811E8e2E824cFb9B6118ac2", "eETH"),
+        // RWA tokens
+        ("0xfAbA6f8e4a5E8Ab82F62fe7C39859FA577269BE3", "ONDO"),
+        ("0xc221b7e65ffc80de234bbb6667abdd46593d34f0", "CFG"),
+        ("0x643C4E15d7d62Ad0aBeC4a9BD4b001aA3Ef52d66", "SYRUP"),
+        ("0x96F6eF951840721AdBF46Ac996b59E0235CB985C", "USDY"),
+        ("0x1B19C19393e2d034D8Ff31ff34c81252FcBbee92", "OUSG"),
+        ("0xaf37c1167910ebC994e266949387d2c7C326b879", "rOUSG"),
     ];
-    
+
     for (addr_str, symbol) in additional {
         if let Ok(addr) = addr_str.parse::<Address>() {
             map.entry(addr).or_insert(symbol);
         }
     }
-    
+
     map
 }
 // ============================================
