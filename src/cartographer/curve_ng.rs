@@ -162,45 +162,92 @@ impl CurveNGPool {
         if self.balances.len() < 2 || i >= self.balances.len() || j >= self.balances.len() {
             return self.base_fee;
         }
-        
+
         let bal_i = self.balances[i].to::<u128>() as f64 / 10_f64.powi(self.decimals[i] as i32);
         let bal_j = self.balances[j].to::<u128>() as f64 / 10_f64.powi(self.decimals[j] as i32);
-        
+
         if bal_i == 0.0 || bal_j == 0.0 {
             return self.base_fee * self.offpeg_multiplier.max(1);
         }
-        
+
         let sum_sq = (bal_i + bal_j).powi(2);
         let product_4 = 4.0 * bal_i * bal_j;
         let imbalance_factor = product_4 / sum_sq;
-        
+
         let effective = (self.base_fee as f64 * self.offpeg_multiplier as f64 * imbalance_factor) as u32;
         effective.max(self.base_fee).min(self.base_fee * self.offpeg_multiplier)
     }
-    
-    /// Convert to standard PoolState for graph integration
+
+    /// Convert to standard PoolState for graph integration using ACCURATE get_dy price
+    /// This is the correct method - uses actual on-chain exchange rate
+    pub fn to_pool_state_with_price(
+        &self,
+        token0_idx: usize,
+        token1_idx: usize,
+        actual_price: f64,  // Price from get_dy: 1 token0 = X token1
+    ) -> Option<PoolState> {
+        if token0_idx >= self.coins.len() || token1_idx >= self.coins.len() {
+            return None;
+        }
+
+        let token0 = self.coins[token0_idx];
+        let token1 = self.coins[token1_idx];
+
+        if actual_price <= 0.0 || !actual_price.is_finite() {
+            return None;
+        }
+
+        let d0 = self.decimals[token0_idx];
+        let d1 = self.decimals[token1_idx];
+        let fee = self.effective_fee(token0_idx, token1_idx);
+
+        // Convert price to sqrt_price_x96 format for consistency with V3
+        // Note: This is for storage/graph only - actual Curve quotes use get_dy
+        let sqrt_price = actual_price.sqrt() * 2_f64.powi(96);
+
+        Some(PoolState {
+            address: self.address,
+            token0,
+            token1,
+            token0_decimals: d0,
+            token1_decimals: d1,
+            sqrt_price_x96: U256::from(sqrt_price as u128),
+            tick: 0,
+            liquidity: self.balances[token0_idx].to::<u128>(),
+            reserve1: self.balances[token1_idx].to::<u128>(),
+            fee,
+            is_v4: false,
+            dex: Dex::Curve,
+            pool_type: PoolType::Curve,
+            weight0: 5 * 10u128.pow(17),
+        })
+    }
+
+    /// DEPRECATED: Use to_pool_state_with_price() with actual get_dy price
+    /// This method uses balance ratios which are INACCURATE for Curve pools
+    #[deprecated(note = "Use to_pool_state_with_price() with actual get_dy price instead")]
     pub fn to_pool_state(&self, token0_idx: usize, token1_idx: usize) -> Option<PoolState> {
         if token0_idx >= self.coins.len() || token1_idx >= self.coins.len() {
             return None;
         }
-        
+
         let token0 = self.coins[token0_idx];
         let token1 = self.coins[token1_idx];
-        
+
         let bal0 = self.balances[token0_idx].to::<u128>() as f64;
         let bal1 = self.balances[token1_idx].to::<u128>() as f64;
-        
+
         if bal0 == 0.0 || bal1 == 0.0 {
             return None;
         }
-        
+
         let d0 = self.decimals[token0_idx];
         let d1 = self.decimals[token1_idx];
-        
+
         let price_raw = (bal1 / 10_f64.powi(d1 as i32)) / (bal0 / 10_f64.powi(d0 as i32));
         let fee = self.effective_fee(token0_idx, token1_idx);
         let sqrt_price = price_raw.sqrt() * 2_f64.powi(96);
-        
+
         Some(PoolState {
             address: self.address,
             token0,
@@ -751,15 +798,119 @@ impl CurveNGFetcher {
         Ok(pools)
     }
     
-    /// Convert discovered pools to PoolState for graph integration
-    pub fn convert_to_pool_states(&self, ng_pools: &[CurveNGPool]) -> Vec<PoolState> {
+    /// Batch fetch accurate prices using get_dy for all pool pairs
+    /// Returns HashMap<(pool_address, i, j), price_float>
+    pub async fn batch_fetch_prices(
+        &self,
+        pools: &[CurveNGPool],
+        base_amount_usd: f64,  // e.g., 10000.0
+    ) -> Result<HashMap<(Address, usize, usize), f64>> {
+        let mut requests = Vec::new();
+        let mut request_map = Vec::new(); // Track which request maps to which pool/pair
+
+        for pool in pools {
+            for i in 0..pool.n_coins {
+                for j in 0..pool.n_coins {
+                    if i == j { continue; }
+
+                    // Skip invalid addresses
+                    if !Self::is_valid_address(&pool.coins[i]) ||
+                       !Self::is_valid_address(&pool.coins[j]) {
+                        continue;
+                    }
+
+                    // Calculate input amount based on token decimals
+                    let decimals = pool.decimals[i];
+                    // For stablecoins, use ~$10000 worth
+                    let dx = U256::from((base_amount_usd * 10_f64.powi(decimals as i32)) as u128);
+
+                    requests.push((pool.address, i as i128, j as i128, dx));
+                    request_map.push((pool.address, i, j, decimals, pool.decimals[j]));
+                }
+            }
+        }
+
+        if requests.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        debug!("Batch fetching {} prices via get_dy", requests.len());
+
+        // Use existing batch_get_dy method
+        let results = self.batch_get_dy(&requests).await?;
+
+        let mut prices = HashMap::new();
+        for (idx, dy_opt) in results.into_iter().enumerate() {
+            if let Some(dy) = dy_opt {
+                let (pool_addr, i, j, dec_i, dec_j) = request_map[idx];
+                let (_, _, _, dx) = requests[idx];
+
+                // Calculate price: dy/dx with decimal adjustment
+                let dx_f64 = dx.to::<u128>() as f64 / 10_f64.powi(dec_i as i32);
+                let dy_f64 = dy.to::<u128>() as f64 / 10_f64.powi(dec_j as i32);
+
+                if dx_f64 > 0.0 {
+                    let price = dy_f64 / dx_f64;
+                    prices.insert((pool_addr, i, j), price);
+                }
+            }
+        }
+
+        info!("Fetched {} accurate Curve prices via get_dy", prices.len());
+        Ok(prices)
+    }
+
+    /// Convert discovered pools to PoolState using ACCURATE get_dy prices
+    /// This is the recommended method - fetches real on-chain exchange rates
+    pub async fn convert_to_pool_states_accurate(&self, ng_pools: &[CurveNGPool]) -> Vec<PoolState> {
+        // Step 1: Batch fetch all prices
+        let prices = match self.batch_fetch_prices(ng_pools, 10000.0).await {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("Failed to fetch Curve prices via get_dy: {}, falling back to deprecated balance ratios", e);
+                #[allow(deprecated)]
+                return self.convert_to_pool_states(ng_pools);
+            }
+        };
+
         let mut states = Vec::new();
-        
+
         for pool in ng_pools {
             for i in 0..pool.n_coins {
                 for j in 0..pool.n_coins {
                     if i == j { continue; }
-                    
+
+                    // Skip invalid addresses
+                    if !Self::is_valid_address(&pool.coins[i]) ||
+                       !Self::is_valid_address(&pool.coins[j]) {
+                        continue;
+                    }
+
+                    // Get pre-fetched price
+                    if let Some(&price) = prices.get(&(pool.address, i, j)) {
+                        if let Some(state) = pool.to_pool_state_with_price(i, j, price) {
+                            states.push(state);
+                        }
+                    }
+                }
+            }
+        }
+
+        debug!("Converted {} NG pools to {} graph edges with accurate get_dy prices", ng_pools.len(), states.len());
+        states
+    }
+
+    /// DEPRECATED: Convert discovered pools to PoolState using balance ratios
+    /// Use convert_to_pool_states_accurate() instead for proper pricing
+    #[deprecated(note = "Use convert_to_pool_states_accurate() for accurate get_dy-based pricing")]
+    pub fn convert_to_pool_states(&self, ng_pools: &[CurveNGPool]) -> Vec<PoolState> {
+        let mut states = Vec::new();
+
+        for pool in ng_pools {
+            for i in 0..pool.n_coins {
+                for j in 0..pool.n_coins {
+                    if i == j { continue; }
+
                     // FILTER: Skip invalid token addresses
                     let token_i = pool.coins[i];
                     let token_j = pool.coins[j];
@@ -767,15 +918,16 @@ impl CurveNGFetcher {
                         debug!("Skipping invalid token in pool {:?}", pool.address);
                         continue;
                     }
-                    
+
+                    #[allow(deprecated)]
                     if let Some(state) = pool.to_pool_state(i, j) {
                         states.push(state);
                     }
                 }
             }
         }
-        
-        debug!("Converted {} NG pools to {} graph edges", ng_pools.len(), states.len());
+
+        debug!("Converted {} NG pools to {} graph edges (DEPRECATED: balance ratios)", ng_pools.len(), states.len());
         states
     }
     

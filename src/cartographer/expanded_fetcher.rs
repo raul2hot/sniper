@@ -603,11 +603,13 @@ impl ExpandedPoolFetcher {
         info!("   Added {} bridging pool edges", bridging_count);
 
         // 2. Discover Curve NG pools (THROTTLED - every 5th scan)
+        // NOW USING ACCURATE get_dy PRICING instead of balance ratios
         if should_fetch_curve_ng {
-            info!("🔍 Discovering Curve NG pools (fresh)...");
+            info!("🔍 Discovering Curve NG pools with accurate get_dy pricing (fresh)...");
             match self.curve_ng_fetcher.discover_all_ng_pools().await {
                 Ok(ng_pools) => {
-                    let states = self.curve_ng_fetcher.convert_to_pool_states(&ng_pools);
+                    // Use the new accurate pricing method that fetches real get_dy prices
+                    let states = self.curve_ng_fetcher.convert_to_pool_states_accurate(&ng_pools).await;
                     result.curve_ng_pools = ng_pools.len();
                     result.curve_ng_states = states.len();
                     result.pool_states.extend(states.clone());
