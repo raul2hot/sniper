@@ -460,12 +460,24 @@ async fn run_scan(
         println!("DEBUG: Cycle {} expected_return: {:.6}", i, c.expected_return);
     }
     
+    // Count suspicious high-return cycles before filtering
+    let suspicious_count = sorted.iter()
+        .filter(|c| c.expected_return >= 1.03)
+        .count();
+    if suspicious_count > 0 {
+        println!("⚠️  Rejecting {} cycles with >3% return (likely bad data/honeypot)", suspicious_count);
+    }
+
+    // Filter for realistic opportunities:
+    // - Min return: 0.01% (1.0001)
+    // - Max return: 3% (1.03) - anything higher is likely bad data or honeypot
+    //   Real arbs are typically 0.01-0.5%, 3% is generous buffer
     let candidates: Vec<_> = sorted.into_iter()
-        .filter(|c| c.expected_return > 1.0001)
+        .filter(|c| c.expected_return > 1.0001 && c.expected_return < 1.03)
         .take(5)
         .collect();
 
-    println!("DEBUG: {} candidates after filter (expected_return > 1.0001)", candidates.len());
+    println!("DEBUG: {} candidates after filter (1.0001 < return < 1.03)", candidates.len());
 
     if candidates.is_empty() {
         return Ok(ScanResult {
