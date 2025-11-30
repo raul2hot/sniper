@@ -532,6 +532,44 @@ impl CurveNGFetcher {
         let dy = ICurveNGPool::get_dyCall::abi_decode_returns(&output)?;
         Ok(dy)
     }
+
+    /// Batch get_dy for multiple pools in a single RPC call
+    /// Returns Vec of Option<U256> - None if call failed for that pool
+    pub async fn batch_get_dy(
+        &self,
+        requests: &[(Address, i128, i128, U256)], // (pool, i, j, dx)
+    ) -> Result<Vec<Option<U256>>> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Build multicall
+        let calls: Vec<IMulticall3::Call3> = requests.iter()
+            .map(|(pool, i, j, dx)| IMulticall3::Call3 {
+                target: *pool,
+                allowFailure: true,
+                callData: ICurveNGPool::get_dyCall { i: *i, j: *j, dx: *dx }.abi_encode().into(),
+            })
+            .collect();
+
+        debug!("Batch get_dy for {} pools", calls.len());
+        let results = self.execute_multicall(calls).await?;
+
+        // Parse results
+        let mut outputs = Vec::with_capacity(requests.len());
+        for result in results {
+            if result.success {
+                match ICurveNGPool::get_dyCall::abi_decode_returns(&result.returnData) {
+                    Ok(dy) => outputs.push(Some(dy)),
+                    Err(_) => outputs.push(None),
+                }
+            } else {
+                outputs.push(None);
+            }
+        }
+
+        Ok(outputs)
+    }
     
     /// OPTIMIZED: Discover all NG pools with caching
     /// - If cache valid: Only fetch balances (1 multicall instead of 9+)

@@ -549,35 +549,61 @@ impl ExpandedPoolFetcher {
         fetcher.fetch_all_pools().await
     }
     
-    /// Add bridging pools WITH actual on-chain prices
+    /// Add bridging pools WITH actual on-chain prices (BATCHED)
+    /// Uses Multicall3 to fetch all prices in a single RPC call
     async fn add_bridging_pools(&self, pool_states: &mut Vec<PoolState>) -> usize {
-        let mut count = 0;
-        
-        for pool_info in get_new_priority_pools() {
+        // Collect valid pools and build batch request
+        let priority_pools = get_new_priority_pools();
+        let mut valid_pools: Vec<(Address, &NewPoolInfo)> = Vec::new();
+
+        for pool_info in &priority_pools {
             if pool_info.address.starts_with("0x...") || pool_info.address.len() < 20 {
                 continue;
             }
-            
-            let Ok(pool_address) = pool_info.address.parse::<Address>() else {
-                continue;
-            };
-            
-            // Fetch actual price from the pool
-            let price = match self.fetch_curve_price(pool_address, 0, 1).await {
-                Ok(p) if p > 0.0 && p.is_finite() => p,
-                _ => {
-                    // Fallback to 1.0 for stablecoin pairs
+            if let Ok(pool_address) = pool_info.address.parse::<Address>() {
+                valid_pools.push((pool_address, pool_info));
+            }
+        }
+
+        if valid_pools.is_empty() {
+            return 0;
+        }
+
+        // Build batch request for all prices
+        let dx = U256::from(10u64.pow(18));
+        let requests: Vec<(Address, i128, i128, U256)> = valid_pools.iter()
+            .map(|(addr, _)| (*addr, 0i128, 1i128, dx))
+            .collect();
+
+        // Batch fetch all prices in 1 RPC call
+        let prices = match self.curve_ng_fetcher.batch_get_dy(&requests).await {
+            Ok(results) => results,
+            Err(e) => {
+                warn!("Batch price fetch failed: {}, using fallback 1.0 for all", e);
+                vec![None; valid_pools.len()]
+            }
+        };
+
+        // Create pool states with fetched prices
+        let mut count = 0;
+        for ((pool_address, pool_info), price_result) in valid_pools.iter().zip(prices.iter()) {
+            let price = match price_result {
+                Some(dy) => {
+                    let p = dy.to::<u128>() as f64 / dx.to::<u128>() as f64;
+                    if p > 0.0 && p.is_finite() { p } else { 1.0 }
+                }
+                None => {
                     warn!("Could not fetch price for {:?}, using 1.0", pool_address);
                     1.0
                 }
             };
-            
+
             let d0 = get_token_decimals(&pool_info.token0);
             let d1 = get_token_decimals(&pool_info.token1);
             let sqrt_price = price.sqrt() * 2_f64.powi(96) * 10_f64.powi((d1 as i32 - d0 as i32) / 2);
-            
+
             let state = PoolState {
-                address: pool_address,
+                address: *pool_address,
                 token0: pool_info.token0,
                 token1: pool_info.token1,
                 token0_decimals: d0,
@@ -592,21 +618,12 @@ impl ExpandedPoolFetcher {
                 pool_type: pool_info.pool_type,
                 weight0: 5 * 10u128.pow(17),
             };
-            
+
             pool_states.push(state);
             count += 1;
         }
-        
-        count
-    }
 
-    /// Fetch price from Curve pool
-    async fn fetch_curve_price(&self, pool: Address, i: i128, j: i128) -> Result<f64> {
-        // Use get_dy to quote 1e18 of token i for token j
-        let dx = U256::from(10u64.pow(18));
-        let dy = self.curve_ng_fetcher.get_dy(pool, i, j, dx).await?;
-        let price = dy.to::<u128>() as f64 / dx.to::<u128>() as f64;
-        Ok(price)
+        count
     }
     /// Convert virtual ERC-4626 pool to PoolState
     fn virtual_pool_to_state(
