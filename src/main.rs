@@ -139,6 +139,10 @@ struct ScanResult {
     profitable_count: usize,
     gas_gwei: f64,
     eth_price: f64,
+    // LP NAV arbitrage fields
+    lp_pools: usize,
+    lp_secondary_markets: usize,
+    lp_opportunities: usize,
 }
 
 #[tokio::main]
@@ -270,16 +274,26 @@ fn print_scan_summary(result: &ScanResult, stats: &Stats, elapsed: std::time::Du
         0.0
     };
 
+    // LP indicator: show LP opportunities if any, otherwise show pool count
+    let lp_indicator = if result.lp_opportunities > 0 {
+        style(format!("LP:{}💰", result.lp_opportunities)).green().bold()
+    } else if result.lp_pools > 0 {
+        style(format!("LP:{}/{}", result.lp_pools, result.lp_secondary_markets)).dim()
+    } else {
+        style("LP:-".to_string()).dim()
+    };
+
     println!(
-        "#{:<4} ⛽{:>5.3}gwei │ {} cycles │ {} sims │ {} │ {:.1}s",
+        "#{:<4} ⛽{:>5.3}gwei │ {} cycles │ {} sims │ {} │ {} │ {:.1}s",
         stats.total_scans,
         result.gas_gwei,
         result.cycles_found,
         result.candidates_simulated,
+        lp_indicator,
         profit_indicator,
         elapsed.as_secs_f64()
     );
-    
+
     // If there's a best path, show it on next line
     if !result.best_path.is_empty() && result.candidates_simulated > 0 {
         let keep_str = if after_bribe > 0.0 {
@@ -327,9 +341,12 @@ async fn run_scan(
             profitable_count: 0,
             gas_gwei,
             eth_price: stats.last_eth_price,
+            lp_pools: 0,
+            lp_secondary_markets: 0,
+            lp_opportunities: 0,
         });
     }
-    
+
     // Fetch pools
     println!("DEBUG: About to fetch pools...");
     let fetcher = ExpandedPoolFetcher::new(config.rpc_url.clone());
@@ -351,6 +368,12 @@ async fn run_scan(
     println!("DEBUG: USDC in pools? {}", has_usdc);
     println!("DEBUG: get_all_known_pools has {} pools", cartographer::get_all_known_pools().len());
     println!("DEBUG: Fetched {} pools", result.pool_states.len());
+
+    // Capture LP NAV data before moving pool_states
+    let lp_pools = result.lp_pools;
+    let lp_secondary_markets = result.lp_secondary_markets;
+    let lp_opportunities = result.lp_nav_opportunities.len();
+
     let pools = result.pool_states;
     
     let eth_price = get_eth_price_from_pools(&pools);
@@ -400,6 +423,9 @@ async fn run_scan(
             profitable_count: 0,
             gas_gwei,
             eth_price,
+            lp_pools,
+            lp_secondary_markets,
+            lp_opportunities,
         });
     }
 
@@ -451,6 +477,9 @@ async fn run_scan(
             profitable_count: 0,
             gas_gwei,
             eth_price,
+            lp_pools,
+            lp_secondary_markets,
+            lp_opportunities,
         });
     }
     // let specials = check_special_opportunities(&result, 50.0).await;
@@ -622,6 +651,9 @@ async fn run_scan(
         profitable_count,
         gas_gwei,
         eth_price,
+        lp_pools,
+        lp_secondary_markets,
+        lp_opportunities,
     })
 }
 
