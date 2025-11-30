@@ -6,6 +6,12 @@
 //! - NEW: Sky Ecosystem (sUSDS, USDS)
 //! - NEW: USD3/Reserve Protocol
 //!
+//! OPTIMIZATIONS:
+//! - Throttles slow-moving data sources to reduce RPC calls
+//! - Curve NG: Only fetch every 5th scan (stablecoin pools change slowly)
+//! - Sky/USD3: Only fetch every 2nd scan (vault rates are slow-moving)
+//! - Caches last fetched data between throttled scans
+//!
 //! Safe extension - does NOT modify existing contracts or handlers.
 
 use alloy_primitives::{Address, U256, address};
@@ -14,8 +20,10 @@ use alloy_sol_types::{sol, SolCall};
 use alloy_rpc_types::TransactionRequest;
 use eyre::{eyre, Result};
 use std::collections::HashMap;
+use std::sync::RwLock;
 use std::time::Instant;
 use tracing::{debug, info, trace, warn};
+use lazy_static::lazy_static;
 
 use super::{Dex, PoolState, PoolType, get_token_decimals};
 use super::curve_ng::{CurveNGFetcher, CurveNGPool};
@@ -23,6 +31,44 @@ use super::sky_ecosystem::{SkyAdapter, ERC4626State, SUSDS_TOKEN, USDS_TOKEN, SD
 use super::usd3_reserve::{USD3Adapter, USD3State, USD3_TOKEN};
 use crate::tokens::build_symbol_map as build_base_symbol_map;
 use std::collections::HashSet;
+
+// ============================================
+// THROTTLE CONFIGURATION
+// ============================================
+
+/// Curve NG: Fetch every N scans (stablecoin pools are slow-moving)
+const CURVE_NG_THROTTLE_INTERVAL: u64 = 5;
+
+/// Sky/USD3: Fetch every N scans (vault rates change slowly)
+const SKY_USD3_THROTTLE_INTERVAL: u64 = 2;
+
+/// Cached data from throttled sources
+struct ThrottledCache {
+    scan_counter: u64,
+    curve_ng_pools: Vec<CurveNGPool>,
+    curve_ng_states: Vec<PoolState>,
+    sky_vaults: Vec<ERC4626State>,
+    sky_virtual_pools: Vec<PoolState>,
+    usd3_state: Option<USD3State>,
+}
+
+impl Default for ThrottledCache {
+    fn default() -> Self {
+        Self {
+            scan_counter: 0,
+            curve_ng_pools: Vec::new(),
+            curve_ng_states: Vec::new(),
+            sky_vaults: Vec::new(),
+            sky_virtual_pools: Vec::new(),
+            usd3_state: None,
+        }
+    }
+}
+
+lazy_static! {
+    /// Global cache for throttled data sources
+    static ref THROTTLE_CACHE: RwLock<ThrottledCache> = RwLock::new(ThrottledCache::default());
+}
 // ============================================
 // BLOCKED TOKENS (known scams/fakes)
 // ============================================
@@ -443,88 +489,152 @@ impl ExpandedPoolFetcher {
     }
     
     /// Fetch ALL pools including new sources
+    /// Uses throttling to reduce RPC calls for slow-moving data sources
     pub async fn fetch_all_pools(&self) -> Result<ExpandedPoolResult> {
         let start = Instant::now();
-        
+
         let mut result = ExpandedPoolResult::default();
-        
-        // 1. Fetch existing pools (from original fetcher)
+
+        // Get and increment scan counter
+        let scan_number = {
+            let mut cache = THROTTLE_CACHE.write().unwrap();
+            cache.scan_counter += 1;
+            cache.scan_counter
+        };
+
+        let should_fetch_curve_ng = scan_number % CURVE_NG_THROTTLE_INTERVAL == 1;
+        let should_fetch_sky_usd3 = scan_number % SKY_USD3_THROTTLE_INTERVAL == 1;
+
+        debug!(
+            "Scan #{}: Curve NG={}, Sky/USD3={}",
+            scan_number,
+            if should_fetch_curve_ng { "FETCH" } else { "CACHE" },
+            if should_fetch_sky_usd3 { "FETCH" } else { "CACHE" }
+        );
+
+        // 1. Fetch existing pools (from original fetcher) - ALWAYS fetch
         info!("📦 Fetching existing pools...");
         let existing_pools = self.fetch_existing_pools().await?;
         result.existing_pools = existing_pools.len();
         result.pool_states.extend(existing_pools);
 
-        // =====================================================
-        // ADD THIS SECTION (NEW STEP 1.5)
-        // =====================================================
-        // 1.5. Add static bridging pools (connects ecosystems)
+        // 1.5. Add static bridging pools (connects ecosystems) - ALWAYS fetch
         info!("🔗 Adding bridging pools...");
         let bridging_count = self.add_bridging_pools(&mut result.pool_states).await;
         info!("   Added {} bridging pool edges", bridging_count);
-        // =====================================================
-        
-        // 2. Discover Curve NG pools
-        info!("🔍 Discovering Curve NG pools...");
-        match self.curve_ng_fetcher.discover_all_ng_pools().await {
-            Ok(ng_pools) => {
-                let states = self.curve_ng_fetcher.convert_to_pool_states(&ng_pools);
-                result.curve_ng_pools = ng_pools.len();
-                result.curve_ng_states = states.len();
-                result.pool_states.extend(states);
-                result.ng_pool_details = ng_pools;
+
+        // 2. Discover Curve NG pools (THROTTLED - every 5th scan)
+        if should_fetch_curve_ng {
+            info!("🔍 Discovering Curve NG pools (fresh)...");
+            match self.curve_ng_fetcher.discover_all_ng_pools().await {
+                Ok(ng_pools) => {
+                    let states = self.curve_ng_fetcher.convert_to_pool_states(&ng_pools);
+                    result.curve_ng_pools = ng_pools.len();
+                    result.curve_ng_states = states.len();
+                    result.pool_states.extend(states.clone());
+                    result.ng_pool_details = ng_pools.clone();
+
+                    // Cache for future throttled scans
+                    let mut cache = THROTTLE_CACHE.write().unwrap();
+                    cache.curve_ng_pools = ng_pools;
+                    cache.curve_ng_states = states;
+                }
+                Err(e) => {
+                    warn!("Failed to discover Curve NG pools: {}", e);
+                }
             }
-            Err(e) => {
-                warn!("Failed to discover Curve NG pools: {}", e);
+        } else {
+            // Use cached data
+            let cache = THROTTLE_CACHE.read().unwrap();
+            if !cache.curve_ng_states.is_empty() {
+                debug!("Using cached Curve NG data ({} pools)", cache.curve_ng_states.len());
+                result.curve_ng_pools = cache.curve_ng_pools.len();
+                result.curve_ng_states = cache.curve_ng_states.len();
+                result.pool_states.extend(cache.curve_ng_states.clone());
+                result.ng_pool_details = cache.curve_ng_pools.clone();
             }
         }
 
-        // Add after Curve NG discovery:
+        // Debug NG pools
         for ng_pool in &result.ng_pool_details {
-            debug!("  NG Pool {:?}: {} coins", ng_pool.address, ng_pool.n_coins);
+            trace!("  NG Pool {:?}: {} coins", ng_pool.address, ng_pool.n_coins);
         }
-        
-        // 3. Fetch Sky ecosystem state
-        info!("🌤️ Fetching Sky ecosystem state...");
-        match self.sky_adapter.fetch_all_vaults().await {
-            Ok(vaults) => {
-                result.erc4626_vaults = vaults.clone();
-                
-                // Create virtual pools for ERC-4626 deposit/redeem
-                for vault in &vaults {
-                    let virtual_pools = super::sky_ecosystem::create_erc4626_virtual_pools(vault);
-                    // Convert virtual pools to PoolState edges
-                    for vp in virtual_pools {
-                        if let Some(state) = self.virtual_pool_to_state(&vp, vault) {
-                            result.pool_states.push(state);
-                            result.virtual_erc4626_edges += 1;
+
+        // 3. Fetch Sky ecosystem state (THROTTLED - every 2nd scan)
+        if should_fetch_sky_usd3 {
+            info!("🌤️ Fetching Sky ecosystem state (fresh)...");
+            match self.sky_adapter.fetch_all_vaults().await {
+                Ok(vaults) => {
+                    result.erc4626_vaults = vaults.clone();
+
+                    // Create virtual pools for ERC-4626 deposit/redeem
+                    let mut virtual_pools_states = Vec::new();
+                    for vault in &vaults {
+                        let virtual_pools = super::sky_ecosystem::create_erc4626_virtual_pools(vault);
+                        for vp in virtual_pools {
+                            if let Some(state) = self.virtual_pool_to_state(&vp, vault) {
+                                virtual_pools_states.push(state);
+                                result.virtual_erc4626_edges += 1;
+                            }
                         }
                     }
+                    result.pool_states.extend(virtual_pools_states.clone());
+
+                    // Cache for future throttled scans
+                    let mut cache = THROTTLE_CACHE.write().unwrap();
+                    cache.sky_vaults = vaults;
+                    cache.sky_virtual_pools = virtual_pools_states;
+                }
+                Err(e) => {
+                    warn!("Failed to fetch Sky ecosystem: {}", e);
                 }
             }
-            Err(e) => {
-                warn!("Failed to fetch Sky ecosystem: {}", e);
+        } else {
+            // Use cached data
+            let cache = THROTTLE_CACHE.read().unwrap();
+            if !cache.sky_virtual_pools.is_empty() {
+                debug!("Using cached Sky data ({} virtual pools)", cache.sky_virtual_pools.len());
+                result.erc4626_vaults = cache.sky_vaults.clone();
+                result.virtual_erc4626_edges = cache.sky_virtual_pools.len();
+                result.pool_states.extend(cache.sky_virtual_pools.clone());
             }
         }
-        
-        // 4. Fetch USD3 state
-        info!("💵 Fetching USD3 NAV...");
-        match self.usd3_adapter.fetch_usd3_state().await {
-            Ok(state) => {
-                result.usd3_state = Some(state);
+
+        // 4. Fetch USD3 state (THROTTLED - every 2nd scan, same as Sky)
+        if should_fetch_sky_usd3 {
+            info!("💵 Fetching USD3 NAV (fresh)...");
+            match self.usd3_adapter.fetch_usd3_state().await {
+                Ok(state) => {
+                    result.usd3_state = Some(state.clone());
+
+                    // Cache for future throttled scans
+                    let mut cache = THROTTLE_CACHE.write().unwrap();
+                    cache.usd3_state = Some(state);
+                }
+                Err(e) => {
+                    warn!("Failed to fetch USD3 state: {}", e);
+                }
             }
-            Err(e) => {
-                warn!("Failed to fetch USD3 state: {}", e);
+        } else {
+            // Use cached data
+            let cache = THROTTLE_CACHE.read().unwrap();
+            if cache.usd3_state.is_some() {
+                debug!("Using cached USD3 data");
+                result.usd3_state = cache.usd3_state.clone();
             }
         }
-        
+
         result.fetch_duration = start.elapsed();
         
         info!(
-            "✅ Expanded fetch complete: {} pools ({} existing, {} NG, {} virtual) in {:?}",
+            "✅ Scan #{}: {} pools ({} existing, {} NG{}, {} virtual{}) in {:?}",
+            scan_number,
             result.pool_states.len(),
             result.existing_pools,
             result.curve_ng_states,
+            if should_fetch_curve_ng { "" } else { " [cached]" },
             result.virtual_erc4626_edges,
+            if should_fetch_sky_usd3 { "" } else { " [cached]" },
             result.fetch_duration
         );
         
