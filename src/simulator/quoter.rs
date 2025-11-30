@@ -2,13 +2,28 @@
 //!
 //! Uses the official Uniswap QuoterV2 contract via eth_call for V3 quotes.
 //! Uses constant product formula for V2 quotes.
+//!
+//! OPTIMIZATIONS:
+//! - Caches immutable pool data (token0, fees) to reduce RPC calls
+//! - Token0/fee lookups are immutable per pool - cache forever
 
 use alloy_primitives::{Address, U256, address};
 use alloy_sol_types::{sol, SolCall};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types::TransactionRequest;
 use eyre::{eyre, Result};
+use std::collections::HashMap;
+use std::sync::RwLock;
 use tracing::debug;
+use lazy_static::lazy_static;
+
+lazy_static! {
+    /// Global cache for pool token0 addresses (immutable per pool)
+    static ref TOKEN0_CACHE: RwLock<HashMap<Address, Address>> = RwLock::new(HashMap::new());
+
+    /// Global cache for V3 pool fees (immutable per pool)
+    static ref FEE_CACHE: RwLock<HashMap<Address, u32>> = RwLock::new(HashMap::new());
+}
 
 // ============================================
 // SOLIDITY INTERFACES
@@ -71,6 +86,11 @@ pub struct QuoteResult {
 const QUOTER_V2: Address = address!("61fFE014bA17989E743c5F6cB21bF9697530B21e");
 
 /// UniV3 Quoter using Provider's eth_call
+///
+/// OPTIMIZATIONS:
+/// - Caches token0 lookups (immutable per pool) - saves ~1 RPC call per swap
+/// - Caches fee lookups (immutable per pool) - saves ~1 RPC call per V3 pool
+/// - After warmup, quoter only needs 1 RPC call per simulation instead of 2-3
 pub struct UniV3Quoter {
     rpc_url: String,
 }
@@ -79,18 +99,18 @@ impl UniV3Quoter {
     pub fn new(rpc_url: String) -> Self {
         Self { rpc_url }
     }
-    
+
     async fn call_contract(&self, to: Address, calldata: Vec<u8>) -> Result<Vec<u8>> {
         let provider = ProviderBuilder::new()
             .on_http(self.rpc_url.parse()?);
-        
+
         let tx = TransactionRequest::default()
             .to(to)
             .input(calldata.into());
-        
+
         let result = provider.call(tx).await
             .map_err(|e| eyre!("eth_call failed: {}", e))?;
-        
+
         Ok(result.to_vec())
     }
     
@@ -200,36 +220,75 @@ impl UniV3Quoter {
         })
     }
     
-    /// Get token0 for a V3 pool
+    /// Get token0 for a V3 pool (CACHED - immutable per pool)
     async fn get_pool_token0(&self, pool: Address) -> Result<Address> {
+        // Check cache first
+        if let Some(token0) = TOKEN0_CACHE.read().unwrap().get(&pool) {
+            return Ok(*token0);
+        }
+
+        // Fetch from chain
         let calldata = IUniswapV3Pool::token0Call {}.abi_encode();
         let output = self.call_contract(pool, calldata).await?;
-        
+
         let decoded = IUniswapV3Pool::token0Call::abi_decode_returns(&output)
             .map_err(|e| eyre!("Failed to decode token0: {}", e))?;
-        
+
+        // Cache it (token0 is immutable)
+        TOKEN0_CACHE.write().unwrap().insert(pool, decoded);
+        debug!("Cached token0 for pool {:?}", pool);
+
         Ok(decoded)
     }
-    
-    /// Get token0 for a V2 pair
+
+    /// Get token0 for a V2 pair (CACHED - immutable per pool)
     async fn get_v2_token0(&self, pool: Address) -> Result<Address> {
+        // Check cache first (shared with V3 - token0 is token0)
+        if let Some(token0) = TOKEN0_CACHE.read().unwrap().get(&pool) {
+            return Ok(*token0);
+        }
+
+        // Fetch from chain
         let calldata = IUniswapV2Pair::token0Call {}.abi_encode();
         let output = self.call_contract(pool, calldata).await?;
-        
+
         let decoded = IUniswapV2Pair::token0Call::abi_decode_returns(&output)
             .map_err(|e| eyre!("Failed to decode token0: {}", e))?;
-        
+
+        // Cache it (token0 is immutable)
+        TOKEN0_CACHE.write().unwrap().insert(pool, decoded);
+        debug!("Cached V2 token0 for pair {:?}", pool);
+
         Ok(decoded)
     }
-    
-    /// Get fee tier for a V3 pool
+
+    /// Get fee tier for a V3 pool (CACHED - immutable per pool)
     pub async fn get_pool_fee(&self, pool: Address) -> Result<u32> {
+        // Check cache first
+        if let Some(fee) = FEE_CACHE.read().unwrap().get(&pool) {
+            return Ok(*fee);
+        }
+
+        // Fetch from chain
         let calldata = IUniswapV3Pool::feeCall {}.abi_encode();
         let output = self.call_contract(pool, calldata).await?;
-        
+
         let decoded = IUniswapV3Pool::feeCall::abi_decode_returns(&output)
             .map_err(|e| eyre!("Failed to decode fee: {}", e))?;
-        
-        Ok(decoded.to())
+
+        let fee: u32 = decoded.to();
+
+        // Cache it (fee is immutable)
+        FEE_CACHE.write().unwrap().insert(pool, fee);
+        debug!("Cached fee {} for pool {:?}", fee, pool);
+
+        Ok(fee)
+    }
+
+    /// Get cache statistics for monitoring
+    pub fn cache_stats() -> (usize, usize) {
+        let token0_count = TOKEN0_CACHE.read().unwrap().len();
+        let fee_count = FEE_CACHE.read().unwrap().len();
+        (token0_count, fee_count)
     }
 }
