@@ -139,7 +139,18 @@ impl SwapSimulator {
     pub fn gas_price_gwei(&self) -> f64 {
         self.gas_price_gwei
     }
-    
+
+    /// Prefetch V2 reserves for multiple pools in a single RPC call
+    /// Call this before simulating cycles to warm the cache and reduce RPC calls
+    pub async fn prefetch_v2_reserves(&self, pools: &[Address]) -> Result<usize> {
+        self.quoter.prefetch_v2_reserves(pools).await
+    }
+
+    /// Get quoter cache statistics for monitoring
+    pub fn quoter_cache_stats() -> (usize, usize, usize, usize) {
+        super::UniV3Quoter::cache_stats()
+    }
+
     pub fn get_liquidity_tier(&self, token: &Address) -> LiquidityTier {
         let addr_hex = format!("{:?}", token).to_lowercase();
         

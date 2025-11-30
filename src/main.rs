@@ -471,6 +471,24 @@ async fn run_scan(
     let swap_sim = SwapSimulator::new(&config.rpc_url).await?;
     // Note: We calculate gas cost separately using gas_info for accuracy
 
+    // === PREFETCH V2 RESERVES (OPTIMIZATION) ===
+    // Collect all V2 pools from candidates and batch-fetch their reserves
+    // This reduces N individual RPC calls to 1 multicall
+    {
+        let v2_pools: Vec<Address> = candidates.iter()
+            .flat_map(|c| c.pools.iter().zip(c.dexes.iter()))
+            .filter(|(_, dex)| matches!(dex, Dex::UniswapV2 | Dex::SushiswapV2))
+            .map(|(pool, _)| *pool)
+            .collect();
+
+        if !v2_pools.is_empty() {
+            match swap_sim.prefetch_v2_reserves(&v2_pools).await {
+                Ok(count) => debug!("Prefetched reserves for {} V2 pools", count),
+                Err(e) => debug!("V2 prefetch failed (will fetch individually): {}", e),
+            }
+        }
+    }
+
     let mut best_gross_profit = 0.0f64;
     let mut best_net_profit = f64::NEG_INFINITY;
     let mut best_path = String::new();
