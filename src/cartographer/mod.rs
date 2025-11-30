@@ -5,6 +5,7 @@
 //! - NEW: Curve StableSwap NG (dynamic discovery + dynamic fees)
 //! - NEW: Sky Ecosystem (sUSDS, USDS - ERC-4626 yield arbitrage)
 //! - NEW: USD3/Reserve Protocol (NAV arbitrage)
+//! - NEW: Curve LP Token NAV arbitrage (secondary market discovery)
 //!
 //! Multicall3 for efficient batch fetching!
 
@@ -16,6 +17,9 @@ pub mod curve_ng;
 pub mod sky_ecosystem;
 pub mod usd3_reserve;
 pub mod expanded_fetcher;
+
+// NEW: Curve LP NAV Arbitrage Module
+pub mod curve_lp;
 
 // Re-exports from original fetcher
 pub use fetcher::{PoolFetcher, PoolState, Dex, PoolType, get_token_decimals, get_all_known_pools, PoolInfo};
@@ -75,4 +79,28 @@ pub use expanded_fetcher::{
     get_new_priority_pools,
     NewPoolInfo,
     check_special_opportunities,
+};
+
+// Re-exports from Curve LP NAV module
+pub use curve_lp::{
+    CurveLPAdapter,
+    CachedLPPool,
+    LPNavCalculator,
+    LPNavResult,
+    LPNavArbitrage,
+    LPArbDirection,
+    LPMarketDiscovery,
+    SecondaryMarket,
+    SecondaryDex,
+    LPNavFetchResult,
+    validate_virtual_price,
+    safe_trade_amount,
+    validate_market_liquidity,
+    calculate_lp_price_from_sqrt,
+    estimate_market_liquidity_usd,
+    LP_POOLS,
+    QUOTE_TOKENS,
+    MIN_NAV_DISCOUNT_BPS,
+    MAX_NAV_PREMIUM_BPS,
+    GAS_BUFFER_BPS,
 };

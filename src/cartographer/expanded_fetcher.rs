@@ -29,6 +29,11 @@ use super::{Dex, PoolState, PoolType, get_token_decimals};
 use super::curve_ng::{CurveNGFetcher, CurveNGPool};
 use super::sky_ecosystem::{SkyAdapter, ERC4626State, SUSDS_TOKEN, USDS_TOKEN, SDAI_TOKEN, DAI_TOKEN};
 use super::usd3_reserve::{USD3Adapter, USD3State, USD3_TOKEN};
+use super::curve_lp::{
+    CurveLPAdapter, LPNavCalculator, LPMarketDiscovery,
+    CachedLPPool, LPNavArbitrage, LPNavResult as LPNavCalcResult,
+    SecondaryMarket, DISCOVERY_THROTTLE_INTERVAL as LP_DISCOVERY_THROTTLE,
+};
 use crate::tokens::build_symbol_map as build_base_symbol_map;
 use std::collections::HashSet;
 
@@ -42,6 +47,9 @@ const CURVE_NG_THROTTLE_INTERVAL: u64 = 5;
 /// Sky/USD3: Fetch every N scans (vault rates change slowly)
 const SKY_USD3_THROTTLE_INTERVAL: u64 = 2;
 
+/// Curve LP NAV: Discover markets every N scans (LP tokens trade infrequently)
+const CURVE_LP_THROTTLE_INTERVAL: u64 = LP_DISCOVERY_THROTTLE;
+
 /// Cached data from throttled sources
 struct ThrottledCache {
     scan_counter: u64,
@@ -50,6 +58,12 @@ struct ThrottledCache {
     sky_vaults: Vec<ERC4626State>,
     sky_virtual_pools: Vec<PoolState>,
     usd3_state: Option<USD3State>,
+    // Curve LP NAV arbitrage cache
+    lp_pools: Vec<CachedLPPool>,
+    lp_secondary_markets: HashMap<Address, Vec<SecondaryMarket>>,
+    lp_market_states: Vec<PoolState>,
+    lp_nav_results: Vec<LPNavCalcResult>,
+    lp_opportunities: Vec<LPNavArbitrage>,
 }
 
 impl Default for ThrottledCache {
@@ -61,6 +75,12 @@ impl Default for ThrottledCache {
             sky_vaults: Vec::new(),
             sky_virtual_pools: Vec::new(),
             usd3_state: None,
+            // LP NAV cache
+            lp_pools: Vec::new(),
+            lp_secondary_markets: HashMap::new(),
+            lp_market_states: Vec::new(),
+            lp_nav_results: Vec::new(),
+            lp_opportunities: Vec::new(),
         }
     }
 }
@@ -306,6 +326,10 @@ pub struct ExpandedPoolFetcher {
     curve_ng_fetcher: CurveNGFetcher,
     sky_adapter: SkyAdapter,
     usd3_adapter: USD3Adapter,
+    // Curve LP NAV arbitrage components
+    lp_adapter: CurveLPAdapter,
+    lp_market_discovery: LPMarketDiscovery,
+    lp_nav_calculator: LPNavCalculator,
 }
 // ============================================
 // POOL QUALITY FILTER
@@ -484,6 +508,9 @@ impl ExpandedPoolFetcher {
             curve_ng_fetcher: CurveNGFetcher::new(rpc_url.clone()),
             sky_adapter: SkyAdapter::new(rpc_url.clone()),
             usd3_adapter: USD3Adapter::new(rpc_url.clone()),
+            lp_adapter: CurveLPAdapter::new(rpc_url.clone()),
+            lp_market_discovery: LPMarketDiscovery::new(rpc_url.clone()),
+            lp_nav_calculator: LPNavCalculator::new(),
             rpc_url,
         }
     }
@@ -624,10 +651,57 @@ impl ExpandedPoolFetcher {
             }
         }
 
+        // 5. Fetch Curve LP NAV arbitrage opportunities (THROTTLED - every 10th scan)
+        let should_fetch_lp = scan_number % CURVE_LP_THROTTLE_INTERVAL == 1;
+        if should_fetch_lp {
+            info!("🎯 Discovering LP NAV arbitrage opportunities (fresh)...");
+            match self.fetch_lp_nav_opportunities().await {
+                Ok((lp_states, lp_pools, lp_markets, nav_results, opportunities)) => {
+                    result.lp_pools = lp_pools.len();
+                    result.lp_secondary_markets = lp_markets.values().map(|v| v.len()).sum();
+                    result.lp_nav_opportunities = opportunities.clone();
+                    result.pool_states.extend(lp_states.clone());
+
+                    // Log opportunities
+                    for opp in &opportunities {
+                        info!(
+                            "  💰 LP Arb: {} - {}bps discount, {} route",
+                            opp.pool_name, opp.discount_bps, opp.direction
+                        );
+                    }
+
+                    // Cache for future scans
+                    let mut cache = THROTTLE_CACHE.write().unwrap();
+                    cache.lp_pools = lp_pools;
+                    cache.lp_secondary_markets = lp_markets;
+                    cache.lp_market_states = lp_states;
+                    cache.lp_nav_results = nav_results;
+                    cache.lp_opportunities = opportunities;
+                }
+                Err(e) => {
+                    warn!("Failed to fetch LP NAV opportunities: {}", e);
+                }
+            }
+        } else {
+            // Use cached LP data
+            let cache = THROTTLE_CACHE.read().unwrap();
+            if !cache.lp_market_states.is_empty() {
+                debug!(
+                    "Using cached LP NAV data ({} pools, {} markets)",
+                    cache.lp_pools.len(),
+                    cache.lp_secondary_markets.values().map(|v| v.len()).sum::<usize>()
+                );
+                result.lp_pools = cache.lp_pools.len();
+                result.lp_secondary_markets = cache.lp_secondary_markets.values().map(|v| v.len()).sum();
+                result.lp_nav_opportunities = cache.lp_opportunities.clone();
+                result.pool_states.extend(cache.lp_market_states.clone());
+            }
+        }
+
         result.fetch_duration = start.elapsed();
-        
+
         info!(
-            "✅ Scan #{}: {} pools ({} existing, {} NG{}, {} virtual{}) in {:?}",
+            "✅ Scan #{}: {} pools ({} existing, {} NG{}, {} virtual{}, {} LP markets{}) in {:?}",
             scan_number,
             result.pool_states.len(),
             result.existing_pools,
@@ -635,8 +709,18 @@ impl ExpandedPoolFetcher {
             if should_fetch_curve_ng { "" } else { " [cached]" },
             result.virtual_erc4626_edges,
             if should_fetch_sky_usd3 { "" } else { " [cached]" },
+            result.lp_secondary_markets,
+            if should_fetch_lp { "" } else { " [cached]" },
             result.fetch_duration
         );
+
+        // Log LP NAV opportunities if any
+        if !result.lp_nav_opportunities.is_empty() {
+            info!(
+                "🎯 {} LP NAV arbitrage opportunities detected!",
+                result.lp_nav_opportunities.len()
+            );
+        }
         
         // ============================================
         // FILTER: Remove suspicious/scam pools
@@ -782,6 +866,125 @@ impl ExpandedPoolFetcher {
     pub fn get_symbol_map(&self) -> HashMap<Address, &'static str> {
         build_expanded_symbol_map()
     }
+
+    /// Fetch LP NAV arbitrage opportunities
+    /// Returns: (pool_states, lp_pools, secondary_markets, nav_results, opportunities)
+    async fn fetch_lp_nav_opportunities(
+        &self,
+    ) -> Result<(
+        Vec<PoolState>,
+        Vec<CachedLPPool>,
+        HashMap<Address, Vec<SecondaryMarket>>,
+        Vec<LPNavCalcResult>,
+        Vec<LPNavArbitrage>,
+    )> {
+        // 1. Get LP pools (uses internal caching)
+        let lp_pools = self.lp_adapter.get_lp_pools().await?;
+        if lp_pools.is_empty() {
+            debug!("No LP pools found");
+            return Ok((Vec::new(), Vec::new(), HashMap::new(), Vec::new(), Vec::new()));
+        }
+
+        info!("  Found {} Curve LP pools", lp_pools.len());
+
+        // 2. Get LP token addresses
+        let lp_tokens: Vec<Address> = lp_pools.iter().map(|p| p.lp_token).collect();
+
+        // 3. Fetch virtual prices (batched)
+        let virtual_prices = self.lp_adapter.fetch_virtual_prices(&lp_tokens).await?;
+        info!("  Fetched {} virtual prices", virtual_prices.len());
+
+        // 4. Discover secondary markets (UniV3 pools where LP tokens trade)
+        let secondary_markets = self.lp_market_discovery.discover_markets(&lp_tokens).await?;
+        let total_markets: usize = secondary_markets.values().map(|v| v.len()).sum();
+        info!("  Discovered {} secondary markets", total_markets);
+
+        // 5. Convert secondary markets to PoolState for routing graph
+        let lp_market_states = self.lp_market_discovery.markets_to_pool_states(&secondary_markets);
+
+        // 6. Fetch UniV3 prices for secondary markets
+        let univ3_pools = self.lp_market_discovery.get_univ3_pool_addresses(&secondary_markets);
+        let univ3_prices = self.lp_market_discovery.fetch_univ3_prices(&univ3_pools).await?;
+        debug!("  Fetched {} UniV3 prices", univ3_prices.len());
+
+        // 7. Calculate NAV for each LP token
+        let nav_results = self.lp_nav_calculator.batch_calculate_nav(&lp_pools, &virtual_prices);
+        info!("  Calculated NAV for {} LP tokens", nav_results.len());
+
+        // 8. Build market price map (LP token -> (price, market))
+        let mut market_prices: HashMap<Address, (U256, SecondaryMarket)> = HashMap::new();
+
+        for (lp_token, markets) in &secondary_markets {
+            for market in markets {
+                // Get price from UniV3 data
+                if let Some((sqrt_price_x96, liquidity)) = univ3_prices.get(&market.pool_address) {
+                    if *liquidity == 0 {
+                        continue;
+                    }
+
+                    // Calculate LP token price in USD
+                    // Assuming quote token is a stablecoin or WETH (need to adjust)
+                    let quote_decimals = get_quote_decimals(&market.quote_token);
+                    let lp_is_token0 = true; // Simplified assumption
+
+                    let price_f64 = super::curve_lp::calculate_lp_price_from_sqrt(
+                        *sqrt_price_x96,
+                        18, // LP tokens are 18 decimals
+                        quote_decimals,
+                        lp_is_token0,
+                    );
+
+                    if price_f64 > 0.0 && price_f64.is_finite() {
+                        // Convert to U256 (18 decimals)
+                        let price_1e18 = U256::from((price_f64 * 1e18) as u128);
+
+                        // Estimate liquidity in USD
+                        let liq_usd = super::curve_lp::estimate_market_liquidity_usd(
+                            *liquidity,
+                            *sqrt_price_x96,
+                            1.0, // Assume quote token at $1 for stables
+                        );
+
+                        let mut market_with_liq = market.clone();
+                        market_with_liq.liquidity_usd = liq_usd;
+
+                        // Only use markets with sufficient liquidity
+                        if liq_usd >= super::curve_lp::MIN_SECONDARY_LIQUIDITY_USD {
+                            market_prices
+                                .entry(*lp_token)
+                                .or_insert((price_1e18, market_with_liq));
+                        }
+                    }
+                }
+            }
+        }
+
+        // 9. Scan for arbitrage opportunities
+        let opportunities = self
+            .lp_nav_calculator
+            .scan_for_opportunities(&nav_results, &market_prices);
+
+        if !opportunities.is_empty() {
+            info!(
+                "  🎯 Found {} LP NAV arbitrage opportunities!",
+                opportunities.len()
+            );
+        }
+
+        Ok((lp_market_states, lp_pools, secondary_markets, nav_results, opportunities))
+    }
+}
+
+/// Get decimals for quote tokens used in LP secondary markets
+fn get_quote_decimals(token: &Address) -> u8 {
+    use super::curve_lp::QUOTE_TOKENS;
+
+    for (addr, _, decimals) in QUOTE_TOKENS.iter() {
+        if addr == token {
+            return *decimals;
+        }
+    }
+    18 // Default
 }
 
 /// Result of expanded pool fetch
@@ -789,30 +992,43 @@ impl ExpandedPoolFetcher {
 pub struct ExpandedPoolResult {
     /// All pool states for graph construction
     pub pool_states: Vec<PoolState>,
-    
+
     /// Count of existing (original) pools
     pub existing_pools: usize,
-    
+
     /// Count of discovered Curve NG pools
     pub curve_ng_pools: usize,
-    
+
     /// Count of pool states from Curve NG
     pub curve_ng_states: usize,
-    
+
     /// Count of virtual ERC-4626 edges
     pub virtual_erc4626_edges: usize,
-    
+
     /// Detailed Curve NG pool info
     pub ng_pool_details: Vec<CurveNGPool>,
-    
+
     /// ERC-4626 vault states
     pub erc4626_vaults: Vec<ERC4626State>,
-    
+
     /// USD3 state (optional)
     pub usd3_state: Option<USD3State>,
-    
+
     /// Time to fetch
     pub fetch_duration: std::time::Duration,
+
+    // ============================================
+    // LP NAV ARBITRAGE FIELDS
+    // ============================================
+
+    /// Count of discovered Curve LP pools
+    pub lp_pools: usize,
+
+    /// Count of secondary markets for LP tokens
+    pub lp_secondary_markets: usize,
+
+    /// Detected LP NAV arbitrage opportunities
+    pub lp_nav_opportunities: Vec<LPNavArbitrage>,
 }
 
 impl ExpandedPoolResult {
@@ -824,13 +1040,24 @@ impl ExpandedPoolResult {
     /// Summary string
     pub fn summary(&self) -> String {
         format!(
-            "{} pools: {} existing + {} NG + {} virtual ({:?})",
+            "{} pools: {} existing + {} NG + {} virtual + {} LP markets ({:?})",
             self.total_pools(),
             self.existing_pools,
             self.curve_ng_states,
             self.virtual_erc4626_edges,
+            self.lp_secondary_markets,
             self.fetch_duration
         )
+    }
+
+    /// Check if LP NAV opportunities are present
+    pub fn has_lp_opportunities(&self) -> bool {
+        !self.lp_nav_opportunities.is_empty()
+    }
+
+    /// Get best LP NAV opportunity (highest discount)
+    pub fn best_lp_opportunity(&self) -> Option<&LPNavArbitrage> {
+        self.lp_nav_opportunities.first()
     }
 }
 
@@ -882,7 +1109,17 @@ pub async fn check_special_opportunities(
             }
         }
     }
-    
+
+    // 4. Check LP NAV arbitrage opportunities
+    for lp_opp in &result.lp_nav_opportunities {
+        opportunities.push(SpecialOpportunity::LPNavArbitrage {
+            lp_token: lp_opp.lp_token,
+            pool_name: lp_opp.pool_name.clone(),
+            discount_bps: lp_opp.discount_bps,
+            estimated_profit_usd: lp_opp.estimated_profit_usd,
+        });
+    }
+
     opportunities
 }
 
@@ -895,19 +1132,27 @@ pub enum SpecialOpportunity {
         symbol: String,
         spread_pct: f64,
     },
-    
+
     /// Basket-backed token trading away from NAV
     NAVArb {
         token: Address,
         symbol: String,
         spread_pct: f64,
     },
-    
+
     /// Curve NG pool with high imbalance (elevated fees)
     ImbalancedPool {
         pool: Address,
         base_fee: u32,
         effective_fee: u32,
+    },
+
+    /// LP token trading below NAV on secondary market
+    LPNavArbitrage {
+        lp_token: Address,
+        pool_name: String,
+        discount_bps: i64,
+        estimated_profit_usd: f64,
     },
 }
 
