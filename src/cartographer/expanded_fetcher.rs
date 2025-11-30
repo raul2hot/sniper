@@ -662,11 +662,26 @@ impl ExpandedPoolFetcher {
                     result.lp_nav_opportunities = opportunities.clone();
                     result.pool_states.extend(lp_states.clone());
 
-                    // Log opportunities
+                    // Always log LP discovery status
+                    info!(
+                        "   LP Discovery: {} pools, {} secondary markets, {} opportunities",
+                        lp_pools.len(),
+                        result.lp_secondary_markets,
+                        opportunities.len()
+                    );
+
+                    // Log opportunities if found
                     for opp in &opportunities {
                         info!(
                             "  💰 LP Arb: {} - {}bps discount, {} route",
                             opp.pool_name, opp.discount_bps, opp.direction
+                        );
+                    }
+
+                    // Log if no markets found (expected for most LP tokens)
+                    if result.lp_secondary_markets == 0 {
+                        debug!(
+                            "   No UniV3 secondary markets found for LP tokens (this is normal - LP tokens rarely trade on UniV3)"
                         );
                     }
 
